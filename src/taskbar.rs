@@ -1,15 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use windows::core::w;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, FindWindowW, GetSystemMetrics, GetWindowRect,
-    GetWindowThreadProcessId, IsWindow, IsWindowVisible, IsZoomed, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, HWND_TOP, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME,
-    SPIF_SENDCHANGE, SPI_SETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSENDCHANGING,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, IsZoomed, SendNotifyMessageW, SetWindowPos,
+    ShowWindow, SystemParametersInfoW, HWND_BROADCAST, HWND_TOP, SM_CXPADDEDBORDER, SM_CXSIZEFRAME,
+    SM_CYSIZEFRAME, SPIF_UPDATEINIFILE, SPI_SETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WM_SETTINGCHANGE,
 };
 
 
@@ -486,7 +486,7 @@ impl TaskbarState {
                                 SPI_SETWORKAREA,
                                 0,
                                 Some(&mut full_rc as *mut RECT as *mut std::ffi::c_void),
-                                SPIF_SENDCHANGE,
+                                SPIF_UPDATEINIFILE,
                             );
                         }
                         adjust_maximized_windows_for_monitor(mon.handle, &full_rc);
@@ -505,7 +505,7 @@ impl TaskbarState {
                         SPI_SETWORKAREA,
                         0,
                         Some(&mut primary_full as *mut RECT as *mut std::ffi::c_void),
-                        SPIF_SENDCHANGE,
+                        SPIF_UPDATEINIFILE,
                     )
                     .context("Nie udało się zaktualizować WorkArea dla monitora głównego")?;
                 }
@@ -556,12 +556,21 @@ impl TaskbarState {
                     SPI_SETWORKAREA,
                     0,
                     Some(&mut target_work as *mut RECT as *mut std::ffi::c_void),
-                    SPIF_SENDCHANGE,
+                    SPIF_UPDATEINIFILE,
                 )
                 .context("Nie udało się zaktualizować WorkArea dla monitora docelowego")?;
             }
         }
         adjust_maximized_windows_for_monitor(target_monitor.handle, &target_work);
+
+        unsafe {
+            let _ = SendNotifyMessageW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                WPARAM(SPI_SETWORKAREA.0 as usize),
+                LPARAM(0),
+            );
+        }
 
         Ok(())
     }
@@ -640,13 +649,13 @@ impl TaskbarState {
                 SPI_SETWORKAREA,
                 0,
                 Some(&mut target_full as *mut RECT as *mut std::ffi::c_void),
-                SPIF_SENDCHANGE,
+                SPIF_UPDATEINIFILE,
             );
             let _ = SystemParametersInfoW(
                 SPI_SETWORKAREA,
                 0,
                 Some(&mut primary_restored_work as *mut RECT as *mut std::ffi::c_void),
-                SPIF_SENDCHANGE,
+                SPIF_UPDATEINIFILE,
             );
         }
         Self::reposition_start_menu(primary_monitor);

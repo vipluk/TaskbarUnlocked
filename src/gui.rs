@@ -98,6 +98,27 @@ struct GuiState {
 
 
 
+#[derive(Clone, Copy)]
+struct ButtonHandles {
+    btn_left: HWND,
+    btn_right: HWND,
+    btn_top: HWND,
+    btn_bottom: HWND,
+    btn_restore: HWND,
+}
+
+impl GuiState {
+    fn button_handles(&self) -> ButtonHandles {
+        ButtonHandles {
+            btn_left: self.btn_left,
+            btn_right: self.btn_right,
+            btn_top: self.btn_top,
+            btn_bottom: self.btn_bottom,
+            btn_restore: self.btn_restore,
+        }
+    }
+}
+
 unsafe impl Send for GuiState {}
 
 static GUI_STATE: Mutex<Option<GuiState>> = Mutex::new(None);
@@ -217,53 +238,53 @@ fn compute_scaled_boxes(monitors: &[MonitorDescriptor], canvas: RECT) -> Vec<Sca
         .collect()
 }
 
-fn update_shm_language_only(state: &GuiState) {
+fn update_shm_language_only(selected_monitor: usize, selected_edge: DockEdge, lang: GuiLang) {
     let prev = load_persisted_settings();
     save_persisted_settings(&PersistedSettings {
         active: true,
         locked: prev.locked,
-        monitor_index: state.selected_monitor,
-        edge: state.selected_edge,
-        lang_mode: state.lang as u32,
+        monitor_index: selected_monitor,
+        edge: selected_edge,
+        lang_mode: lang as u32,
     });
     if let Ok(shm) = ShmGuard::create_or_open() {
         if let Some(mut cfg) = shm.read() {
-            cfg.lang_mode = state.lang as u32;
+            cfg.lang_mode = lang as u32;
             shm.write(&cfg);
         }
     }
 }
 
-fn apply_selected_settings(state: &mut GuiState) -> Result<()> {
+fn apply_selected_settings(selected_monitor: usize, selected_edge: DockEdge, lang: GuiLang) -> Result<()> {
     disable_legacy_v2_shm();
     let prev = load_persisted_settings();
     save_persisted_settings(&PersistedSettings {
         active: true,
         locked: prev.locked,
-        monitor_index: state.selected_monitor,
-        edge: state.selected_edge,
-        lang_mode: state.lang as u32,
+        monitor_index: selected_monitor,
+        edge: selected_edge,
+        lang_mode: lang as u32,
     });
 
     let monitors = enumerate_monitors()?;
     let primary = get_primary_monitor(&monitors)?;
-    let target = get_target_monitor(&monitors, state.selected_monitor)?;
+    let target = get_target_monitor(&monitors, selected_monitor)?;
 
     let cfg = TaskbarTargetConfig {
-        target_monitor_index: state.selected_monitor,
-        edge: state.selected_edge,
+        target_monitor_index: selected_monitor,
+        edge: selected_edge,
         size_override: None,
         hide_secondary_tray: true,
     };
 
-    TaskbarState::update_registry_taskbar_location(state.selected_edge);
+    TaskbarState::update_registry_taskbar_location(selected_edge);
 
     let mut tb_state = TaskbarState::locate(&target, cfg.edge, cfg.size_override)?;
-    TaskbarState::update_registry_stuck_rects3(state.selected_edge, &tb_state.desired_rect);
+    TaskbarState::update_registry_stuck_rects3(selected_edge, &tb_state.desired_rect);
 
     let shm = ShmGuard::create_or_open()?;
     let mut shm_cfg = build_shared_config(true, &cfg, &primary, &target, &tb_state);
-    shm_cfg.lang_mode = state.lang as u32;
+    shm_cfg.lang_mode = lang as u32;
     shm.write(&shm_cfg);
 
     if let Ok(dll_path) = resolve_hook_dll_path() {
@@ -275,15 +296,19 @@ fn apply_selected_settings(state: &mut GuiState) -> Result<()> {
     tb_state.notify_tray_layout_refresh();
     TaskbarState::update_work_areas(&primary, &target, &tb_state.desired_rect, cfg.edge)?;
 
-    state.monitors = enumerate_monitors().unwrap_or(monitors);
+    if let Ok(mut guard) = GUI_STATE.lock() {
+        if let Some(st) = guard.as_mut() {
+            st.monitors = enumerate_monitors().unwrap_or(monitors);
+        }
+    }
     Ok(())
 }
 
-fn restore_to_primary(state: &mut GuiState) -> Result<()> {
+fn restore_to_primary(selected_monitor: usize, selected_edge: DockEdge, lang: GuiLang) -> Result<()> {
     disable_legacy_v2_shm();
     let monitors = enumerate_monitors()?;
     let primary = get_primary_monitor(&monitors)?;
-    let target = get_target_monitor(&monitors, state.selected_monitor)
+    let target = get_target_monitor(&monitors, selected_monitor)
         .unwrap_or_else(|_| primary.clone());
 
     let prev = load_persisted_settings();
@@ -291,14 +316,13 @@ fn restore_to_primary(state: &mut GuiState) -> Result<()> {
         active: false,
         locked: prev.locked,
         monitor_index: primary.index,
-        edge: state.selected_edge,
-        lang_mode: state.lang as u32,
+        edge: selected_edge,
+        lang_mode: lang as u32,
     });
-
 
     let cfg = TaskbarTargetConfig {
         target_monitor_index: primary.index,
-        edge: state.selected_edge,
+        edge: selected_edge,
         size_override: None,
         hide_secondary_tray: true,
     };
@@ -306,21 +330,26 @@ fn restore_to_primary(state: &mut GuiState) -> Result<()> {
     let tb_state = TaskbarState::locate(&target, cfg.edge, cfg.size_override)?;
     if let Ok(shm) = ShmGuard::create_or_open() {
         let mut disabled = build_shared_config(false, &cfg, &primary, &target, &tb_state);
-        disabled.lang_mode = state.lang as u32;
+        disabled.lang_mode = lang as u32;
         disabled.context_menu_enabled = 1;
         shm.write(&disabled);
     }
 
     tb_state.restore_default(&primary, &target)?;
-    state.selected_monitor = primary.index;
-    state.monitors = enumerate_monitors().unwrap_or(monitors);
+
+    if let Ok(mut guard) = GUI_STATE.lock() {
+        if let Some(st) = guard.as_mut() {
+            st.selected_monitor = primary.index;
+            st.monitors = enumerate_monitors().unwrap_or(monitors);
+        }
+    }
     Ok(())
 }
 
-fn refresh_control_labels(hwnd: HWND, state: &GuiState) {
-    let s = get_gui_strings(state.lang);
+fn refresh_control_labels(hwnd: HWND, lang: GuiLang, selected_edge: DockEdge, btns: ButtonHandles) {
+    let s = get_gui_strings(lang);
     let edge_label = |edge: DockEdge, base: &str| -> String {
-        if state.selected_edge == edge {
+        if selected_edge == edge {
             format!("● {}", base)
         } else {
             format!("○ {}", base)
@@ -330,28 +359,28 @@ fn refresh_control_labels(hwnd: HWND, state: &GuiState) {
     unsafe {
         let _ = SetWindowTextW(hwnd, PCWSTR(to_wide(s.window_title).as_ptr()));
         let _ = SetWindowTextW(
-            state.btn_left,
+            btns.btn_left,
             PCWSTR(to_wide(&edge_label(DockEdge::Left, s.edge_left)).as_ptr()),
         );
         let _ = SetWindowTextW(
-            state.btn_right,
+            btns.btn_right,
             PCWSTR(to_wide(&edge_label(DockEdge::Right, s.edge_right)).as_ptr()),
         );
         let _ = SetWindowTextW(
-            state.btn_top,
+            btns.btn_top,
             PCWSTR(to_wide(&edge_label(DockEdge::Top, s.edge_top)).as_ptr()),
         );
         let _ = SetWindowTextW(
-            state.btn_bottom,
+            btns.btn_bottom,
             PCWSTR(to_wide(&edge_label(DockEdge::Bottom, s.edge_bottom)).as_ptr()),
         );
-        let _ = SetWindowTextW(state.btn_restore, PCWSTR(to_wide(s.btn_restore).as_ptr()));
+        let _ = SetWindowTextW(btns.btn_restore, PCWSTR(to_wide(s.btn_restore).as_ptr()));
         for b in [
-            state.btn_left,
-            state.btn_right,
-            state.btn_top,
-            state.btn_bottom,
-            state.btn_restore,
+            btns.btn_left,
+            btns.btn_right,
+            btns.btn_top,
+            btns.btn_bottom,
+            btns.btn_restore,
         ] {
             if !b.0.is_null() {
                 let _ = InvalidateRect(b, None, false);
@@ -672,7 +701,12 @@ unsafe extern "system" fn gui_wnd_proc(
 
                     let sel_idx = if st.lang == GuiLang::Polish { 0 } else { 1 };
                     SendMessageW(combo, CB_SETCURSEL, WPARAM(sel_idx), LPARAM(0));
-                    refresh_control_labels(hwnd, st);
+                    let init_btns = st.button_handles();
+                    let init_lang = st.lang;
+                    let init_edge = st.selected_edge;
+                    drop(guard);
+                    refresh_control_labels(hwnd, init_lang, init_edge, init_btns);
+                    return LRESULT(0);
                 }
             }
             LRESULT(0)
@@ -810,7 +844,7 @@ unsafe extern "system" fn gui_wnd_proc(
                 return LRESULT(0);
             }
 
-            let mut changed = false;
+            let mut apply_action = None;
             if let Ok(mut guard) = GUI_STATE.lock() {
                 if let Some(st) = guard.as_mut() {
                     for b in &st.scaled_boxes {
@@ -819,17 +853,17 @@ unsafe extern "system" fn gui_wnd_proc(
                             && y >= b.box_rect.top
                             && y <= b.box_rect.bottom
                         {
-                            st.selected_monitor = b.index;
-                            changed = true;
+                            if st.selected_monitor != b.index {
+                                st.selected_monitor = b.index;
+                                apply_action = Some((st.selected_monitor, st.selected_edge, st.lang));
+                            }
                             break;
                         }
                     }
-                    if changed {
-                        let _ = apply_selected_settings(st);
-                    }
                 }
             }
-            if changed {
+            if let Some((mon, edge, lang)) = apply_action {
+                let _ = apply_selected_settings(mon, edge, lang);
                 let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
@@ -839,20 +873,26 @@ unsafe extern "system" fn gui_wnd_proc(
             let code = ((wparam.0 >> 16) & 0xFFFF) as u16;
 
             if id == ID_COMBO_LANG && code == CBN_SELCHANGE_CODE {
+                let mut lang_action = None;
                 if let Ok(mut guard) = GUI_STATE.lock() {
                     if let Some(st) = guard.as_mut() {
                         let cur = SendMessageW(st.combo_hwnd, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
                         st.lang = if cur == 0 { GuiLang::Polish } else { GuiLang::English };
-                        update_shm_language_only(st);
-                        refresh_control_labels(hwnd, st);
+                        lang_action = Some((st.selected_monitor, st.selected_edge, st.lang, st.button_handles()));
                     }
+                }
+                if let Some((mon, edge, lang, btns)) = lang_action {
+                    update_shm_language_only(mon, edge, lang);
+                    refresh_control_labels(hwnd, lang, edge, btns);
                 }
                 let _ = InvalidateRect(hwnd, None, true);
                 return LRESULT(0);
             }
 
             if code == BN_CLICKED_CODE {
-                let mut should_repaint = false;
+                let mut action_apply = None;
+                let mut action_restore = None;
+
                 if let Ok(mut guard) = GUI_STATE.lock() {
                     if let Some(st) = guard.as_mut() {
                         match id {
@@ -863,19 +903,23 @@ unsafe extern "system" fn gui_wnd_proc(
                                     ID_BTN_EDGE_TOP => DockEdge::Top,
                                     _ => DockEdge::Bottom,
                                 };
-                                refresh_control_labels(hwnd, st);
-                                let _ = apply_selected_settings(st);
-                                should_repaint = true;
+                                action_apply = Some((st.selected_monitor, st.selected_edge, st.lang, st.button_handles()));
                             }
                             ID_BTN_RESTORE => {
-                                let _ = restore_to_primary(st);
-                                should_repaint = true;
+                                action_restore = Some((st.selected_monitor, st.selected_edge, st.lang, st.button_handles()));
                             }
                             _ => {}
                         }
                     }
                 }
-                if should_repaint {
+
+                if let Some((mon, edge, lang, btns)) = action_apply {
+                    refresh_control_labels(hwnd, lang, edge, btns);
+                    let _ = apply_selected_settings(mon, edge, lang);
+                    let _ = InvalidateRect(hwnd, None, false);
+                } else if let Some((mon, edge, lang, btns)) = action_restore {
+                    refresh_control_labels(hwnd, lang, edge, btns);
+                    let _ = restore_to_primary(mon, edge, lang);
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             }
