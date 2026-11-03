@@ -415,6 +415,7 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
 
     TaskbarState::update_registry_taskbar_location(config.edge);
     TaskbarState::update_registry_stuck_rects3(config.edge, &state.desired_rect);
+    TaskbarState::adapt_searchbox_for_edge(config.edge);
     state.enforce_position()?;
     state.notify_tray_layout_refresh();
     TaskbarState::update_work_areas(
@@ -569,6 +570,7 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
 
                                     TaskbarState::update_registry_taskbar_location(new_edge);
                                     TaskbarState::update_registry_stuck_rects3(new_edge, &new_rect);
+                                    TaskbarState::adapt_searchbox_for_edge(new_edge);
 
                                     let mut new_shm = build_shared_config(
                                         true,

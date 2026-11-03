@@ -416,6 +416,7 @@ pub fn perform_uninstall() -> Result<()> {
             // 1. Zapisz w rejestrze Windows fabryczny dół monitora głównego
             TaskbarState::update_registry_taskbar_location(DockEdge::Bottom);
             TaskbarState::update_registry_stuck_rects3(DockEdge::Bottom, &default_restore_rect);
+            TaskbarState::restore_saved_searchbox_mode();
 
             // 2. Wyłącz pamięć współdzieloną
             let cfg = TaskbarTargetConfig {

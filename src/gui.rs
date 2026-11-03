@@ -278,6 +278,7 @@ fn apply_selected_settings(selected_monitor: usize, selected_edge: DockEdge, lan
     };
 
     TaskbarState::update_registry_taskbar_location(selected_edge);
+    TaskbarState::adapt_searchbox_for_edge(selected_edge);
 
     let mut tb_state = TaskbarState::locate(&target, cfg.edge, cfg.size_override)?;
     TaskbarState::update_registry_stuck_rects3(selected_edge, &tb_state.desired_rect);
@@ -335,6 +336,8 @@ fn restore_to_primary(selected_monitor: usize, selected_edge: DockEdge, lang: Gu
         shm.write(&disabled);
     }
 
+    TaskbarState::update_registry_taskbar_location(DockEdge::Bottom);
+    TaskbarState::adapt_searchbox_for_edge(DockEdge::Bottom);
     tb_state.restore_default(&primary, &target)?;
 
     if let Ok(mut guard) = GUI_STATE.lock() {

@@ -350,6 +350,185 @@ impl TaskbarState {
         }
     }
 
+    pub fn adapt_searchbox_for_edge(edge: DockEdge) {
+        use windows::Win32::System::Registry::{
+            RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW,
+            RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_DWORD,
+            REG_OPTION_NON_VOLATILE,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+        };
+        use windows::Win32::Foundation::WPARAM;
+
+        let is_vertical = matches!(edge, DockEdge::Left | DockEdge::Right);
+
+        unsafe {
+            if is_vertical {
+                // Odczytaj aktualny tryb wyszukiwarki z konfiguracji Windows
+                let mut search_key = HKEY::default();
+                if RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    w!("Software\\Microsoft\\Windows\\CurrentVersion\\Search"),
+                    0,
+                    KEY_READ | KEY_SET_VALUE,
+                    &mut search_key,
+                )
+                .is_ok()
+                {
+                    let mut current_mode: u32 = 0;
+                    let mut len = std::mem::size_of::<u32>() as u32;
+                    let q_res = RegQueryValueExW(
+                        search_key,
+                        w!("SearchboxTaskbarMode"),
+                        None,
+                        None,
+                        Some(&mut current_mode as *mut u32 as *mut u8),
+                        Some(&mut len),
+                    );
+
+                    // Jeśli tryb to 2 (Search box) lub 3 (Search button with label),
+                    // to w pionie (szerokość 48px) silnik XAML go zwinie (zniknie ikona).
+                    // Zapamiętujemy tryb użytkownika i przestawiamy na 1 (Sama ikona).
+                    if q_res.is_ok() && (current_mode == 2 || current_mode == 3) {
+                        let mut app_key = HKEY::default();
+                        if RegCreateKeyExW(
+                            HKEY_CURRENT_USER,
+                            w!("Software\\TaskbarUnlocked"),
+                            0,
+                            None,
+                            REG_OPTION_NON_VOLATILE,
+                            KEY_SET_VALUE,
+                            None,
+                            &mut app_key,
+                            None,
+                        )
+                        .is_ok()
+                        {
+                            let _ = RegSetValueExW(
+                                app_key,
+                                w!("SavedHorizontalSearchMode"),
+                                0,
+                                REG_DWORD,
+                                Some(&current_mode.to_le_bytes()),
+                            );
+                            let _ = RegCloseKey(app_key);
+                        }
+
+                        let icon_mode: u32 = 1;
+                        let _ = RegSetValueExW(
+                            search_key,
+                            w!("SearchboxTaskbarMode"),
+                            0,
+                            REG_DWORD,
+                            Some(&icon_mode.to_le_bytes()),
+                        );
+                        let _ = RegSetValueExW(
+                            search_key,
+                            w!("SearchboxTaskbarModeCache"),
+                            0,
+                            REG_DWORD,
+                            Some(&icon_mode.to_le_bytes()),
+                        );
+
+                        // Natychmiastowe odświeżenie paska bez restartu explorer.exe
+                        let mut dw_res = 0usize;
+                        let _ = SendMessageTimeoutW(
+                            HWND_BROADCAST,
+                            WM_SETTINGCHANGE,
+                            WPARAM(0),
+                            LPARAM(w!("TraySettings").as_ptr() as isize),
+                            SMTO_ABORTIFHUNG,
+                            300,
+                            Some(&mut dw_res),
+                        );
+                    }
+                    let _ = RegCloseKey(search_key);
+                }
+            } else {
+                // Pozycja pozioma (Góra / Dół). Przywracamy zapamiętany tryb szerokiego pola.
+                Self::restore_saved_searchbox_mode();
+            }
+        }
+    }
+
+    pub fn restore_saved_searchbox_mode() {
+        use windows::Win32::System::Registry::{
+            RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+            RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_DWORD,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+        };
+        use windows::Win32::Foundation::WPARAM;
+
+        unsafe {
+            let mut app_key = HKEY::default();
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                w!("Software\\TaskbarUnlocked"),
+                0,
+                KEY_READ | KEY_SET_VALUE,
+                &mut app_key,
+            )
+            .is_ok()
+            {
+                let mut saved_mode: u32 = 0;
+                let mut len = std::mem::size_of::<u32>() as u32;
+                let q_res = RegQueryValueExW(
+                    app_key,
+                    w!("SavedHorizontalSearchMode"),
+                    None,
+                    None,
+                    Some(&mut saved_mode as *mut u32 as *mut u8),
+                    Some(&mut len),
+                );
+
+                if q_res.is_ok() && (saved_mode == 2 || saved_mode == 3) {
+                    let mut search_key = HKEY::default();
+                    if RegOpenKeyExW(
+                        HKEY_CURRENT_USER,
+                        w!("Software\\Microsoft\\Windows\\CurrentVersion\\Search"),
+                        0,
+                        KEY_SET_VALUE,
+                        &mut search_key,
+                    )
+                    .is_ok()
+                    {
+                        let _ = RegSetValueExW(
+                            search_key,
+                            w!("SearchboxTaskbarMode"),
+                            0,
+                            REG_DWORD,
+                            Some(&saved_mode.to_le_bytes()),
+                        );
+                        let _ = RegSetValueExW(
+                            search_key,
+                            w!("SearchboxTaskbarModeCache"),
+                            0,
+                            REG_DWORD,
+                            Some(&saved_mode.to_le_bytes()),
+                        );
+                        let _ = RegCloseKey(search_key);
+                    }
+                    let _ = RegDeleteValueW(app_key, w!("SavedHorizontalSearchMode"));
+
+                    let mut dw_res = 0usize;
+                    let _ = SendMessageTimeoutW(
+                        HWND_BROADCAST,
+                        WM_SETTINGCHANGE,
+                        WPARAM(0),
+                        LPARAM(w!("TraySettings").as_ptr() as isize),
+                        SMTO_ABORTIFHUNG,
+                        300,
+                        Some(&mut dw_res),
+                    );
+                }
+                let _ = RegCloseKey(app_key);
+            }
+        }
+    }
+
     pub fn reposition_start_menu(target_monitor: &MonitorDescriptor) {
         unsafe {
             let mut child = HWND::default();
