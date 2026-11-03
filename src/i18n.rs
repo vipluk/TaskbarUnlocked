@@ -1,5 +1,8 @@
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 
+pub const GITHUB_REPO_URL: windows::core::PCWSTR = windows::core::w!("https://github.com/vipluk/TaskbarUnlocked");
+pub const GITHUB_DISPLAY_TEXT: &str = "GitHub: vipluk/TaskbarUnlocked";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuiLang {
     Polish = 1,

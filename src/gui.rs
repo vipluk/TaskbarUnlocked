@@ -6,21 +6,22 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, S
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateBitmap, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW,
     EndPaint, FillRect, FrameRect, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
-    MonitorFromPoint, RoundRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+    MonitorFromPoint, RoundRect, ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetTextColor,
     CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_QUALITY, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
     FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetCursorPos, GetMessageW, LoadCursorW, LoadIconW, PostQuitMessage,
-    RegisterClassW, SendMessageW, SetWindowTextW, ShowWindow, TranslateMessage, CB_ADDSTRING,
-    CB_GETCURSEL, CB_SETCURSEL, HICON, HMENU, ICONINFO, IDC_ARROW, MSG, SW_SHOW, WM_COMMAND,
-    WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM,
-    WM_LBUTTONDOWN, WM_PAINT, WM_SETICON, WNDCLASSW, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE,
+    RegisterClassW, SendMessageW, SetCursor, SetWindowTextW, ShowWindow, TranslateMessage, CB_ADDSTRING,
+    CB_GETCURSEL, CB_SETCURSEL, HICON, HMENU, ICONINFO, IDC_ARROW, IDC_HAND, MSG, SW_SHOW,
+    SW_SHOWNORMAL, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC,
+    WM_DESTROY, WM_DRAWITEM, WM_LBUTTONDOWN, WM_PAINT, WM_SETCURSOR, WM_SETICON, WNDCLASSW, WS_CHILD,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 #[link(name = "dwmapi")]
@@ -43,7 +44,11 @@ extern "system" {
 }
 
 
-use crate::i18n::{detect_default_gui_lang, get_gui_strings, GuiLang};
+use crate::i18n::{
+
+    detect_default_gui_lang, get_gui_strings, GuiLang, GITHUB_DISPLAY_TEXT, GITHUB_REPO_URL,
+
+};
 use crate::injector::ensure_hook_dll_injected;
 use crate::installer::{load_persisted_settings, save_persisted_settings, PersistedSettings};
 use crate::ipc::{disable_legacy_v2_shm, ShmGuard};
@@ -77,7 +82,6 @@ struct GuiState {
     scaled_boxes: Vec<ScaledMonitorBox>,
     selected_monitor: usize,
     selected_edge: DockEdge,
-    status_text: String,
     combo_hwnd: HWND,
     btn_left: HWND,
     btn_right: HWND,
@@ -548,9 +552,9 @@ unsafe fn paint_gui(hwnd: HWND, hdc: HDC, state: &mut GuiState) {
     DrawTextW(hdc, &mut to_wide(s.edge_section_title), &mut edge_title_rc, DT_SINGLELINE | DT_VCENTER);
 
     SelectObject(hdc, state.font_small);
-    SetTextColor(hdc, rgb(74, 222, 128));
-    let mut status_rc = RECT { left: 24, top: 446, right: client.right - 24, bottom: 472 };
-    DrawTextW(hdc, &mut to_wide(&state.status_text), &mut status_rc, DT_SINGLELINE | DT_VCENTER);
+    SetTextColor(hdc, rgb(76, 194, 255));
+    let mut github_rc = RECT { left: 24, top: 446, right: client.right - 24, bottom: 472 };
+    DrawTextW(hdc, &mut to_wide(GITHUB_DISPLAY_TEXT), &mut github_rc, DT_SINGLELINE | DT_VCENTER);
 
     SelectObject(hdc, old_font);
 }
@@ -779,9 +783,32 @@ unsafe extern "system" fn gui_wnd_proc(
         }
 
 
+        WM_SETCURSOR => {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let _ = ScreenToClient(hwnd, &mut pt);
+            if pt.x >= 24 && pt.x <= 280 && pt.y >= 446 && pt.y <= 472 {
+                let hand = LoadCursorW(None, IDC_HAND).unwrap_or_default();
+                SetCursor(hand);
+                return LRESULT(1);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_LBUTTONDOWN => {
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+            if x >= 24 && x <= 280 && y >= 446 && y <= 472 {
+                let _ = ShellExecuteW(
+                    HWND::default(),
+                    w!("open"),
+                    GITHUB_REPO_URL,
+                    PCWSTR::null(),
+                    PCWSTR::null(),
+                    SW_SHOWNORMAL,
+                );
+                return LRESULT(0);
+            }
 
             let mut changed = false;
             if let Ok(mut guard) = GUI_STATE.lock() {
@@ -799,7 +826,6 @@ unsafe extern "system" fn gui_wnd_proc(
                     }
                     if changed {
                         let _ = apply_selected_settings(st);
-                        st.status_text = get_gui_strings(st.lang).status_applied.to_string();
                     }
                 }
             }
@@ -818,7 +844,6 @@ unsafe extern "system" fn gui_wnd_proc(
                         let cur = SendMessageW(st.combo_hwnd, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
                         st.lang = if cur == 0 { GuiLang::Polish } else { GuiLang::English };
                         update_shm_language_only(st);
-                        st.status_text = get_gui_strings(st.lang).status_ready.to_string();
                         refresh_control_labels(hwnd, st);
                     }
                 }
@@ -840,12 +865,10 @@ unsafe extern "system" fn gui_wnd_proc(
                                 };
                                 refresh_control_labels(hwnd, st);
                                 let _ = apply_selected_settings(st);
-                                st.status_text = get_gui_strings(st.lang).status_applied.to_string();
                                 should_repaint = true;
                             }
                             ID_BTN_RESTORE => {
                                 let _ = restore_to_primary(st);
-                                st.status_text = get_gui_strings(st.lang).status_restored.to_string();
                                 should_repaint = true;
                             }
                             _ => {}
@@ -911,7 +934,6 @@ pub fn run_settings_gui() -> Result<()> {
         }
     }
 
-    let status_text = get_gui_strings(initial_lang).status_ready.to_string();
 
     {
         let mut guard = GUI_STATE.lock().unwrap();
@@ -921,7 +943,6 @@ pub fn run_settings_gui() -> Result<()> {
             scaled_boxes: Vec::new(),
             selected_monitor: initial_monitor,
             selected_edge: initial_edge,
-            status_text,
             combo_hwnd: HWND::default(),
             btn_left: HWND::default(),
             btn_right: HWND::default(),
