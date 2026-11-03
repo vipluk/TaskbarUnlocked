@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND};
+use windows::Win32::Foundation::{CloseHandle, HWND, RECT};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -358,6 +358,43 @@ pub fn perform_install() -> Result<()> {
     Ok(())
 }
 
+fn restart_explorer() {
+    let snap = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut pe = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    if unsafe { Process32FirstW(snap, &mut pe) }.is_ok() {
+        loop {
+            let nul_pos = pe
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(pe.szExeFile.len());
+            let name = String::from_utf16_lossy(&pe.szExeFile[..nul_pos]).to_ascii_lowercase();
+            if name == "explorer.exe" {
+                if let Ok(hp) = unsafe { OpenProcess(PROCESS_TERMINATE, false, pe.th32ProcessID) } {
+                    unsafe {
+                        let _ = TerminateProcess(hp, 0);
+                        let _ = CloseHandle(hp);
+                    }
+                }
+            }
+            if unsafe { Process32NextW(snap, &mut pe) }.is_err() {
+                break;
+            }
+        }
+    }
+    unsafe {
+        let _ = CloseHandle(snap);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let _ = std::process::Command::new("explorer.exe").spawn();
+}
+
 pub fn perform_uninstall() -> Result<()> {
     disable_legacy_v2_shm();
     kill_other_instances();
@@ -368,16 +405,30 @@ pub fn perform_uninstall() -> Result<()> {
         if let Ok(primary) = get_primary_monitor(&monitors) {
             let target = get_target_monitor(&monitors, settings.monitor_index)
                 .unwrap_or_else(|_| primary.clone());
+
+            let default_restore_rect = RECT {
+                left: primary.monitor_rect.left,
+                top: primary.monitor_rect.bottom - 48,
+                right: primary.monitor_rect.right,
+                bottom: primary.monitor_rect.bottom,
+            };
+
+            // 1. Zapisz w rejestrze Windows fabryczny dół monitora głównego
+            TaskbarState::update_registry_taskbar_location(DockEdge::Bottom);
+            TaskbarState::update_registry_stuck_rects3(DockEdge::Bottom, &default_restore_rect);
+
+            // 2. Wyłącz pamięć współdzieloną
             let cfg = TaskbarTargetConfig {
                 target_monitor_index: primary.index,
-                edge: settings.edge,
+                edge: DockEdge::Bottom,
                 size_override: None,
-                hide_secondary_tray: true,
+                hide_secondary_tray: false,
             };
             if let Ok(tb_state) = TaskbarState::locate(&target, cfg.edge, None) {
                 if let Ok(shm) = ShmGuard::create_or_open() {
                     let mut disabled = build_shared_config(false, &cfg, &primary, &target, &tb_state);
                     disabled.active = 0;
+                    disabled.target_hmonitor = 0;
                     disabled.context_menu_enabled = 0;
                     shm.write(&disabled);
                 }
@@ -402,8 +453,13 @@ pub fn perform_uninstall() -> Result<()> {
         }
         let mut settings = load_persisted_settings();
         settings.active = false;
+        settings.monitor_index = 0;
+        settings.edge = DockEdge::Bottom;
         save_persisted_settings(&settings);
     }
+
+    // 3. Zrestartuj proces explorer.exe, aby zwolnić hook DLL i wczytać czysty natywny pasek zadań
+    restart_explorer();
 
     if let Ok(install_dir) = get_install_dir() {
         let _ = std::fs::remove_dir_all(&install_dir);

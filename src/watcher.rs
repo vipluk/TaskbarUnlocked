@@ -235,13 +235,13 @@ unsafe extern "system" fn hidden_wnd_proc(
                             ctx.enforcing_lock = true;
                             let _ = ctx.state.enforce_position();
                             ctx.enforcing_lock = false;
+                            work_args = Some((
+                                ctx.primary_monitor.clone(),
+                                ctx.target_monitor.clone(),
+                                ctx.state.desired_rect,
+                                ctx.config.edge,
+                            ));
                         }
-                        work_args = Some((
-                            ctx.primary_monitor.clone(),
-                            ctx.target_monitor.clone(),
-                            ctx.state.desired_rect,
-                            ctx.config.edge,
-                        ));
                     }
                 }
             }

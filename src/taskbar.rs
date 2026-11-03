@@ -1,15 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use windows::core::w;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, FindWindowW, GetSystemMetrics, GetWindowRect,
-    GetWindowThreadProcessId, IsWindow, IsWindowVisible, IsZoomed, SendNotifyMessageW, SetWindowPos,
-    ShowWindow, SystemParametersInfoW, HWND_BROADCAST, HWND_TOP, SM_CXPADDEDBORDER, SM_CXSIZEFRAME,
-    SM_CYSIZEFRAME, SPIF_UPDATEINIFILE, SPI_SETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WM_SETTINGCHANGE,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, IsZoomed, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, HWND_TOP, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME,
+    SPIF_UPDATEINIFILE, SPI_SETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSENDCHANGING,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA,
 };
 
 
@@ -108,6 +108,7 @@ pub struct TaskbarState {
     pub main_tray_hwnd: HWND,
     pub thread_id: u32,
     pub process_id: u32,
+    #[allow(dead_code)]
     pub original_rect: RECT,
     pub desired_rect: RECT,
     pub hidden_secondary_trays: Vec<HWND>,
@@ -563,15 +564,6 @@ impl TaskbarState {
         }
         adjust_maximized_windows_for_monitor(target_monitor.handle, &target_work);
 
-        unsafe {
-            let _ = SendNotifyMessageW(
-                HWND_BROADCAST,
-                WM_SETTINGCHANGE,
-                WPARAM(SPI_SETWORKAREA.0 as usize),
-                LPARAM(0),
-            );
-        }
-
         Ok(())
     }
 
@@ -590,21 +582,14 @@ impl TaskbarState {
             }
         }
 
-        let orig_w = (self.original_rect.right - self.original_rect.left).clamp(48, 1920);
-        let orig_h = (self.original_rect.bottom - self.original_rect.top).clamp(48, 1080);
-
-        // Jeśli original_rect leży poza monitorem głównym, przywróć na prawą krawędź monitora głównego
+        // Przywróć fabryczny, poziomy pasek zadań na dole monitora głównego (domyślny Windows 11)
         let pm = primary_monitor.monitor_rect;
-        let restore_rect = if self.original_rect.left >= pm.left && self.original_rect.right <= pm.right {
-            self.original_rect
-        } else {
-            let thickness = orig_w.min(orig_h).clamp(48, 96);
-            RECT {
-                left: pm.right - thickness,
-                top: pm.top,
-                right: pm.right,
-                bottom: pm.bottom,
-            }
+        let thickness = 48i32;
+        let restore_rect = RECT {
+            left: pm.left,
+            top: pm.bottom - thickness,
+            right: pm.right,
+            bottom: pm.bottom,
         };
 
         if self.is_valid() {
@@ -626,23 +611,7 @@ impl TaskbarState {
 
         let mut target_full = target_monitor.monitor_rect;
         let mut primary_restored_work = pm;
-        let rw = restore_rect.right - restore_rect.left;
-        let rh = restore_rect.bottom - restore_rect.top;
-        if rw < rh {
-            // Pionowy pasek na monitorze głównym
-            if restore_rect.left == pm.left {
-                primary_restored_work.left = pm.left + rw;
-            } else {
-                primary_restored_work.right = pm.right - rw;
-            }
-        } else {
-            // Poziomy pasek na monitorze głównym
-            if restore_rect.top == pm.top {
-                primary_restored_work.top = pm.top + rh;
-            } else {
-                primary_restored_work.bottom = pm.bottom - rh;
-            }
-        }
+        primary_restored_work.bottom = pm.bottom - thickness;
 
         unsafe {
             let _ = SystemParametersInfoW(
