@@ -442,6 +442,7 @@ impl TaskbarState {
                             300,
                             Some(&mut dw_res),
                         );
+                        Self::restart_search_host();
                     }
                     let _ = RegCloseKey(search_key);
                 }
@@ -523,8 +524,47 @@ impl TaskbarState {
                         300,
                         Some(&mut dw_res),
                     );
+                    Self::restart_search_host();
                 }
                 let _ = RegCloseKey(app_key);
+            }
+        }
+    }
+
+    pub fn restart_search_host() {
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        use windows::Win32::Foundation::CloseHandle;
+
+        if let Ok(snap) = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
+            let mut pe = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            unsafe {
+                if Process32FirstW(snap, &mut pe).is_ok() {
+                    loop {
+                        let nul_pos = pe
+                            .szExeFile
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(pe.szExeFile.len());
+                        let name = String::from_utf16_lossy(&pe.szExeFile[..nul_pos]).to_ascii_lowercase();
+                        if name == "searchhost.exe" {
+                            if let Ok(hp) = OpenProcess(PROCESS_TERMINATE, false, pe.th32ProcessID) {
+                                let _ = TerminateProcess(hp, 0);
+                                let _ = CloseHandle(hp);
+                            }
+                        }
+                        if Process32NextW(snap, &mut pe).is_err() {
+                            break;
+                        }
+                    }
+                }
+                let _ = CloseHandle(snap);
             }
         }
     }

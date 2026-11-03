@@ -966,6 +966,7 @@ pub fn run_settings_gui() -> Result<()> {
         primary.index
     };
     let mut initial_edge = persisted.edge;
+    TaskbarState::adapt_searchbox_for_edge(initial_edge);
 
     if let Some(shm) = ShmGuard::open_existing() {
         if let Some(cfg) = shm.read() {

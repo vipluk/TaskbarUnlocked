@@ -222,6 +222,7 @@ fn main() -> Result<()> {
         let primary = crate::monitor::get_primary_monitor(&monitors)?;
         let target = crate::monitor::get_target_monitor(&monitors, config.target_monitor_index)?;
         TaskbarState::update_registry_taskbar_location(config.edge);
+        TaskbarState::adapt_searchbox_for_edge(config.edge);
         let mut state = TaskbarState::locate(&target, config.edge, config.size_override)?;
         TaskbarState::update_registry_stuck_rects3(config.edge, &state.desired_rect);
         let prev = load_persisted_settings();

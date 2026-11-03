@@ -216,33 +216,48 @@ impl TaskbarDragController {
             .or_else(|| monitors.first())?;
 
         let m = mon.monitor_rect;
-        let w = (m.right - m.left).max(1) as f64;
-        let h = (m.bottom - m.top).max(1) as f64;
+        let w = (m.right - m.left).max(1);
+        let h = (m.bottom - m.top).max(1);
 
-        let d_left = (pt.x - m.left).abs() as f64 / w;
-        let d_right = (m.right - pt.x).abs() as f64 / w;
-        let d_top = (pt.y - m.top).abs() as f64 / h;
-        let d_bottom = (m.bottom - pt.y).abs() as f64 / h;
+        // Strefy brzegowe ekranu (25% od każdej krawędzi)
+        let margin_x = (w / 4).max(64);
+        let margin_y = (h / 4).max(64);
 
-        let mut best_edge = DockEdge::Left;
-        let mut best_dist = d_left;
+        let best_edge = if pt.x <= m.left + margin_x {
+            DockEdge::Left
+        } else if pt.x >= m.right - margin_x {
+            DockEdge::Right
+        } else if pt.y <= m.top + margin_y {
+            DockEdge::Top
+        } else if pt.y >= m.bottom - margin_y {
+            DockEdge::Bottom
+        } else {
+            // W strefie środkowej: wybierz krawędź najbliższą geometrycznie
+            let d_left = (pt.x - m.left).abs();
+            let d_right = (m.right - pt.x).abs();
+            let d_top = (pt.y - m.top).abs();
+            let d_bottom = (m.bottom - pt.y).abs();
 
-        if d_right < best_dist {
-            best_dist = d_right;
-            best_edge = DockEdge::Right;
-        }
-        if d_top < best_dist {
-            best_dist = d_top;
-            best_edge = DockEdge::Top;
-        }
-        if d_bottom < best_dist {
-            best_edge = DockEdge::Bottom;
-        }
+            let mut edge = DockEdge::Left;
+            let mut min_d = d_left;
+
+            if d_right < min_d {
+                min_d = d_right;
+                edge = DockEdge::Right;
+            }
+            if d_top < min_d {
+                min_d = d_top;
+                edge = DockEdge::Top;
+            }
+            if d_bottom < min_d {
+                edge = DockEdge::Bottom;
+            }
+            edge
+        };
 
         let dummy_cur = RECT { left: 0, top: 0, right: 48, bottom: 48 };
         let preview_rc = TaskbarState::compute_desired_rect(&dummy_cur, mon, best_edge, None);
         Some((mon.index, best_edge, preview_rc))
-
     }
 
     pub fn poll_step(&mut self, tray_hwnd: HWND, locked: bool) -> Option<(usize, DockEdge)> {
@@ -276,15 +291,14 @@ impl TaskbarDragController {
                 }
                 None
             }
-            DragPhase::PressedOnTaskbar { origin, tray_rect } => {
+            DragPhase::PressedOnTaskbar { origin, .. } => {
                 if !lbutton_down {
                     self.phase = DragPhase::Idle;
                     return None;
                 }
-                let outside = !Self::point_in_rect(pt, &tray_rect);
                 let dx = (pt.x - origin.x).abs();
                 let dy = (pt.y - origin.y).abs();
-                if outside && (dx >= 22 || dy >= 22) {
+                if dx >= 14 || dy >= 14 {
                     if let Ok(monitors) = enumerate_monitors() {
                         if let Some((mon_idx, edge, preview_rc)) =
                             Self::pick_monitor_and_edge(pt, &monitors)
