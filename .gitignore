@@ -1,0 +1,17 @@
+# Build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Binaries
+*.exe
+*.dll
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs & temp
+*.log
