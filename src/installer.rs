@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND, RECT};
+use windows::Win32::Foundation::{CloseHandle, HWND};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -300,6 +300,7 @@ pub fn perform_install() -> Result<()> {
     }
 
 
+    let _ = crate::storage::load_or_init_storage();
     let mut initial_settings = load_persisted_settings();
     initial_settings.active = true;
     save_persisted_settings(&initial_settings);
@@ -406,17 +407,8 @@ pub fn perform_uninstall() -> Result<()> {
             let target = get_target_monitor(&monitors, settings.monitor_index)
                 .unwrap_or_else(|_| primary.clone());
 
-            let default_restore_rect = RECT {
-                left: primary.monitor_rect.left,
-                top: primary.monitor_rect.bottom - 48,
-                right: primary.monitor_rect.right,
-                bottom: primary.monitor_rect.bottom,
-            };
-
             // 1. Zapisz w rejestrze Windows fabryczny dół monitora głównego
-            TaskbarState::update_registry_taskbar_location(DockEdge::Bottom);
-            TaskbarState::update_registry_stuck_rects3(DockEdge::Bottom, &default_restore_rect);
-            TaskbarState::restore_saved_searchbox_mode();
+            let _ = crate::storage::restore_windows_baseline();
 
             // 2. Wyłącz pamięć współdzieloną
             let cfg = TaskbarTargetConfig {

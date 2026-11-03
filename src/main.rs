@@ -8,6 +8,7 @@ mod installer;
 mod ipc;
 mod monitor;
 mod taskbar;
+mod storage;
 mod watcher;
 
 
@@ -81,6 +82,10 @@ pub struct Cli {
     /// Przywróć pasek zadań oraz obszary robocze (WorkArea) na monitor główny i zakończ
     #[arg(long)]
     pub restore: bool,
+
+    /// Przywróć system Windows do 100% stanu fabrycznego sprzed pierwszej instalacji aplikacji
+    #[arg(long)]
+    pub restore_baseline: bool,
 
 
     /// Indeks monitora docelowego (sprawdź dostępne indeksy za pomocą --list)
@@ -197,6 +202,12 @@ fn main() -> Result<()> {
         size_override: cli.size,
         hide_secondary_tray: !cli.keep_secondary_tray,
     };
+
+    if cli.restore_baseline {
+        crate::storage::restore_windows_baseline()?;
+        println!("Przywrócono fabryczny stan rejestru Windows (Searchbox, TaskbarLocation, StuckRects3) z kopii w Dokumentach.");
+        return Ok(());
+    }
 
     if cli.restore {
         let monitors = enumerate_monitors()?;

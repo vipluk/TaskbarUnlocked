@@ -553,6 +553,14 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
                                 },
                             );
 
+                            let mut disk_storage = crate::storage::load_or_init_storage();
+                            disk_storage.preferences.edge = new_edge;
+                            disk_storage.preferences.monitor_index = new_mon_idx;
+                            disk_storage.preferences.locked = is_locked;
+                            disk_storage.preferences.active = true;
+                            disk_storage.preferences.updated_at = crate::storage::current_timestamp();
+                            let _ = crate::storage::save_storage(&disk_storage);
+
                             if let Ok(monitors) = enumerate_monitors() {
                                 if let (Ok(primary), Ok(target)) = (
                                     get_primary_monitor(&monitors),
