@@ -23,6 +23,7 @@ pub struct GuiStrings {
     pub edge_bottom: &'static str,
     pub btn_apply: &'static str,
     pub btn_restore: &'static str,
+    pub lock_taskbar: &'static str,
     pub status_ready: &'static str,
     pub status_applied: &'static str,
     pub status_restored: &'static str,
@@ -42,6 +43,7 @@ pub static STRINGS_PL: GuiStrings = GuiStrings {
     edge_bottom: "Dół (Poziomo)",
     btn_apply: "Zastosuj na wybranym monitorze",
     btn_restore: "Przywróć na monitor główny",
+    lock_taskbar: "Zablokuj pasek zadań",
     status_ready: "Gotowy — kliknij dowolny monitor lub krawędź, aby od razu przenieść pasek zadań.",
     status_applied: "Zapisano i zastosowano! Pasek zadań jest przypięty do wybranego monitora.",
 
@@ -62,6 +64,7 @@ pub static STRINGS_EN: GuiStrings = GuiStrings {
     edge_bottom: "Bottom (Horizontal)",
     btn_apply: "Apply to selected monitor",
     btn_restore: "Restore to primary monitor",
+    lock_taskbar: "Lock the taskbar",
     status_ready: "Ready — click any monitor or edge to move the taskbar immediately.",
     status_applied: "Saved and applied! Taskbar is pinned to the selected monitor.",
 

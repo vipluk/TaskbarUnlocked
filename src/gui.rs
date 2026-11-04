@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -64,6 +64,7 @@ const ID_BTN_EDGE_RIGHT: usize = 2011;
 const ID_BTN_EDGE_TOP: usize = 2012;
 const ID_BTN_EDGE_BOTTOM: usize = 2013;
 const ID_BTN_RESTORE: usize = 2021;
+const ID_CHK_LOCK: usize = 2030;
 
 
 const CBN_SELCHANGE_CODE: u16 = 1;
@@ -88,6 +89,9 @@ struct GuiState {
     btn_top: HWND,
     btn_bottom: HWND,
     btn_restore: HWND,
+    is_locked: bool,
+    chk_lock: HWND,
+    bg_window_brush: HBRUSH,
     font_regular: HFONT,
     font_bold: HFONT,
     font_small: HFONT,
@@ -105,6 +109,7 @@ struct ButtonHandles {
     btn_top: HWND,
     btn_bottom: HWND,
     btn_restore: HWND,
+    chk_lock: HWND,
 }
 
 impl GuiState {
@@ -115,6 +120,7 @@ impl GuiState {
             btn_top: self.btn_top,
             btn_bottom: self.btn_bottom,
             btn_restore: self.btn_restore,
+            chk_lock: self.chk_lock,
         }
     }
 }
@@ -381,12 +387,14 @@ fn refresh_control_labels(hwnd: HWND, lang: GuiLang, selected_edge: DockEdge, bt
             PCWSTR(to_wide(&edge_label(DockEdge::Bottom, s.edge_bottom)).as_ptr()),
         );
         let _ = SetWindowTextW(btns.btn_restore, PCWSTR(to_wide(s.btn_restore).as_ptr()));
+        let _ = SetWindowTextW(btns.chk_lock, PCWSTR(to_wide(s.lock_taskbar).as_ptr()));
         for b in [
             btns.btn_left,
             btns.btn_right,
             btns.btn_top,
             btns.btn_bottom,
             btns.btn_restore,
+            btns.chk_lock,
         ] {
             if !b.0.is_null() {
                 let _ = InvalidateRect(b, None, false);
@@ -690,6 +698,25 @@ unsafe extern "system" fn gui_wnd_proc(
 
             let btn_restore = make_btn(ID_BTN_RESTORE, 24, 402, 582, 36);
 
+            let bg_window_brush = CreateSolidBrush(rgb(24, 26, 32));
+            let chk_lock = CreateWindowExW(
+                Default::default(),
+                w!("BUTTON"),
+                w!(""),
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_TABSTOP
+                    | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0x0003), // BS_AUTOCHECKBOX
+                410, 446, 196, 26,
+                hwnd,
+                HMENU(ID_CHK_LOCK as *mut std::ffi::c_void),
+                hinst,
+                None,
+            )
+            .unwrap_or_default();
+            SendMessageW(chk_lock, 0x0030, WPARAM(font_reg.0 as usize), LPARAM(1));
+            let _ = SetWindowTheme(chk_lock, w!("DarkMode_Explorer"), PCWSTR::null());
+
             if let Ok(mut guard) = GUI_STATE.lock() {
                 if let Some(st) = guard.as_mut() {
                     st.combo_hwnd = combo;
@@ -698,12 +725,21 @@ unsafe extern "system" fn gui_wnd_proc(
                     st.btn_top = btn_top;
                     st.btn_bottom = btn_bottom;
                     st.btn_restore = btn_restore;
+                    st.chk_lock = chk_lock;
+                    st.bg_window_brush = bg_window_brush;
                     st.font_regular = font_reg;
                     st.font_bold = font_bold;
                     st.font_small = font_small;
                     st.fonts_scale = fonts_scale;
                     st.fonts_scale_bold = fonts_scale_bold;
                     st.dark_ctrl_brush = dark_ctrl_brush;
+
+                    SendMessageW(
+                        chk_lock,
+                        0x00F1, /* BM_SETCHECK */
+                        WPARAM(if st.is_locked { 1 } else { 0 }),
+                        LPARAM(0),
+                    );
 
                     let sel_idx = if st.lang == GuiLang::Polish { 0 } else { 1 };
                     SendMessageW(combo, CB_SETCURSEL, WPARAM(sel_idx), LPARAM(0));
@@ -719,11 +755,17 @@ unsafe extern "system" fn gui_wnd_proc(
         }
         WM_CTLCOLORLISTBOX | WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
             let hdc_ctrl = HDC(wparam.0 as *mut std::ffi::c_void);
-            SetTextColor(hdc_ctrl, rgb(238, 242, 248));
-            SetBkColor(hdc_ctrl, rgb(43, 49, 62));
+            let hwnd_ctrl = HWND(lparam.0 as *mut std::ffi::c_void);
             if let Ok(guard) = GUI_STATE.lock() {
                 if let Some(st) = guard.as_ref() {
+                    if hwnd_ctrl == st.chk_lock {
+                        SetTextColor(hdc_ctrl, rgb(238, 242, 248));
+                        SetBkColor(hdc_ctrl, rgb(24, 26, 32));
+                        return LRESULT(st.bg_window_brush.0 as isize);
+                    }
                     if !st.dark_ctrl_brush.0.is_null() {
+                        SetTextColor(hdc_ctrl, rgb(238, 242, 248));
+                        SetBkColor(hdc_ctrl, rgb(43, 49, 62));
                         return LRESULT(st.dark_ctrl_brush.0 as isize);
                     }
                 }
@@ -895,6 +937,33 @@ unsafe extern "system" fn gui_wnd_proc(
                 return LRESULT(0);
             }
 
+            if id == ID_CHK_LOCK && code == BN_CLICKED_CODE {
+                let mut new_locked = false;
+                if let Ok(mut guard) = GUI_STATE.lock() {
+                    if let Some(st) = guard.as_mut() {
+                        let check_state =
+                            SendMessageW(st.chk_lock, 0x00F0 /* BM_GETCHECK */, WPARAM(0), LPARAM(0)).0;
+                        st.is_locked = check_state == 1;
+                        new_locked = st.is_locked;
+                        let prev = load_persisted_settings();
+                        save_persisted_settings(&PersistedSettings {
+                            active: prev.active,
+                            locked: new_locked,
+                            monitor_index: st.selected_monitor,
+                            edge: st.selected_edge,
+                            lang_mode: st.lang as u32,
+                        });
+                    }
+                }
+                if let Some(shm) = ShmGuard::open_existing() {
+                    if let Some(mut cfg) = shm.read() {
+                        cfg.locked = if new_locked { 1 } else { 0 };
+                        shm.write(&cfg);
+                    }
+                }
+                return LRESULT(0);
+            }
+
             if code == BN_CLICKED_CODE {
                 let mut action_apply = None;
                 let mut action_restore = None;
@@ -944,6 +1013,18 @@ unsafe extern "system" fn gui_wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            if let Ok(mut guard) = GUI_STATE.lock() {
+                if let Some(st) = guard.as_mut() {
+                    if !st.bg_window_brush.0.is_null() {
+                        let _ = DeleteObject(st.bg_window_brush);
+                        st.bg_window_brush = HBRUSH::default();
+                    }
+                    if !st.dark_ctrl_brush.0.is_null() {
+                        let _ = DeleteObject(st.dark_ctrl_brush);
+                        st.dark_ctrl_brush = HBRUSH::default();
+                    }
+                }
+            }
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -971,6 +1052,8 @@ pub fn run_settings_gui() -> Result<()> {
     let mut initial_edge = persisted.edge;
     TaskbarState::adapt_searchbox_for_edge(initial_edge);
 
+    let mut initial_locked = persisted.locked;
+
     if let Some(shm) = ShmGuard::open_existing() {
         if let Some(cfg) = shm.read() {
             if cfg.lang_mode == 1 {
@@ -982,18 +1065,23 @@ pub fn run_settings_gui() -> Result<()> {
                 initial_monitor = cfg.target_monitor_index as usize;
             }
             initial_edge = abe_to_edge(cfg.edge);
+            initial_locked = cfg.locked != 0;
         }
     }
 
 
     {
-        let mut guard = GUI_STATE.lock().unwrap();
+        let mut guard = GUI_STATE
+            .lock()
+            .map_err(|_| anyhow!("Blokada GUI_STATE uległa zatruciu"))?;
         *guard = Some(GuiState {
             lang: initial_lang,
             monitors,
             scaled_boxes: Vec::new(),
             selected_monitor: initial_monitor,
             selected_edge: initial_edge,
+            is_locked: initial_locked,
+            chk_lock: HWND::default(),
             combo_hwnd: HWND::default(),
             btn_left: HWND::default(),
             btn_right: HWND::default(),
@@ -1006,6 +1094,7 @@ pub fn run_settings_gui() -> Result<()> {
             fonts_scale: [HFONT::default(); 7],
             fonts_scale_bold: [HFONT::default(); 7],
             dark_ctrl_brush: HBRUSH::default(),
+            bg_window_brush: HBRUSH::default(),
         });
 
     }
