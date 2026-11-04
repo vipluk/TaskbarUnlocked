@@ -4,6 +4,7 @@
 [![Tested On](https://img.shields.io/badge/Tested%20On-Win11%2026H2%20(Build%2026300%20%7C%2026340)-blue.svg)](#tested-system-environments)
 [![Language](https://img.shields.io/badge/Language-Rust-DEA584?logo=rust)](https://www.rust-lang.org/)
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white)](https://discord.gg/A7WVnYj3BP)
 
 > **Unlock and freely drag the Windows 11 taskbar to any screen edge across all monitors.**
 
@@ -80,6 +81,12 @@ You can also control `taskbar-unlocked.exe` via CLI flags:
 .\taskbar-unlocked.exe --restore
 .\taskbar-unlocked.exe --restore-baseline
 ```
+
+---
+
+## Community & Support
+
+If you want to report a bug, suggest new features, ask questions, or chat about the project, join our [Discord server](https://discord.gg/A7WVnYj3BP).
 
 ---
 
