@@ -1,7 +1,7 @@
 # TaskbarUnlocked 🔓
 
 [![Platform](https://img.shields.io/badge/Platform-Windows%2011-0078D4?logo=windows)](https://www.microsoft.com/windows)
-[![Tested On](https://img.shields.io/badge/Tested%20On-Win11%2026H2%20(26340.9767)-blue.svg)](#tested-system-environment)
+[![Tested On](https://img.shields.io/badge/Tested%20On-Win11%2026H2%20(Build%2026300%20%7C%2026340)-blue.svg)](#tested-system-environments)
 [![Language](https://img.shields.io/badge/Language-Rust-DEA584?logo=rust)](https://www.rust-lang.org/)
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](LICENSE)
 
@@ -30,17 +30,14 @@ Windows 11 removed the ability to drag and position the taskbar to different edg
 
 ---
 
-## Tested System Environment
+## Tested System Environments
 
-This application has been built and tested on the following system configuration:
+This application has been verified and tested on real hardware across both official Windows 11 production builds and Windows Insider channels:
 
-| Property | Value |
-| :--- | :--- |
-| **Operating System** | Microsoft Windows 11 |
-| **Feature Release** | **26H2** |
-| **OS Build** | **26340.9767** |
-| **Kernel Version** | 10.0.26340.9767 |
-| **Architecture** | x86_64 (64-bit) |
+| Environment | Edition | Feature Release | OS Build | Kernel / Experience Pack |
+| :--- | :--- | :--- | :--- | :--- |
+| **Official Release (Production)** | Windows 11 Home | **26H2** | **26300.9818** | Feature Experience Pack 1000.26100.385.0 |
+| **Windows Insider Preview** | Windows 11 Pro / Insider | **26H2** | **26340.9767** | Kernel 10.0.26340.9767 |
 
 > [!NOTE]
 > Conceived, directed, and tested on real hardware by human oversight, with the entire codebase implemented by advanced AI reasoning models primarily from Google alongside Anthropic (no OpenAI models were used).
