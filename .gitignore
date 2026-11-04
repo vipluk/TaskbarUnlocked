@@ -15,3 +15,7 @@
 
 # Logs & temp
 *.log
+
+# Markdown files (keep only root README.md)
+*.md
+!README.md
