@@ -31,7 +31,7 @@ pub struct WindowsBaseline {
     pub searchbox_mode_cache: u32,
     #[serde(default = "default_one")]
     pub widgets_mode: u32,
-    #[serde(default = "default_one")]
+    #[serde(default)]
     pub task_view_mode: u32,
     #[serde(default)]
     pub chat_mode: u32,
@@ -48,7 +48,7 @@ pub struct UserPreferences {
     pub vertical_search_mode: u32,
     #[serde(default = "default_one")]
     pub horizontal_widgets_mode: u32,
-    #[serde(default = "default_one")]
+    #[serde(default)]
     pub horizontal_task_view_mode: u32,
     #[serde(default)]
     pub horizontal_chat_mode: u32,
@@ -68,7 +68,7 @@ impl Default for UserPreferences {
             horizontal_search_mode: 2,
             vertical_search_mode: 1,
             horizontal_widgets_mode: 1,
-            horizontal_task_view_mode: 1,
+            horizontal_task_view_mode: 0,
             horizontal_chat_mode: 0,
             last_applied_vertical: false,
             monitor_index: 1,
@@ -80,6 +80,8 @@ impl Default for UserPreferences {
         }
     }
 }
+
+
 
 pub fn current_timestamp() -> String {
     if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -142,11 +144,12 @@ pub fn read_current_windows_registry_baseline() -> WindowsBaseline {
     let mut search_mode = 2u32;
     let mut search_mode_cache = 2u32;
     let mut widgets_mode = 1u32;
-    let mut task_view_mode = 1u32;
+    let mut task_view_mode = 0u32;
     let mut chat_mode = 0u32;
     let mut taskbar_location = 3u32;
     let mut taskbar_alignment = None;
     let mut stuck_rects3 = Vec::new();
+
 
     unsafe {
         let mut key = HKEY::default();
@@ -304,6 +307,8 @@ pub fn load_or_init_storage() -> AppDiskStorage {
     prefs.horizontal_widgets_mode = baseline.widgets_mode;
     prefs.horizontal_task_view_mode = baseline.task_view_mode;
     prefs.horizontal_chat_mode = baseline.chat_mode;
+
+
 
     let storage = AppDiskStorage {
         baseline,
@@ -521,13 +526,6 @@ pub fn restore_windows_baseline(primary_rect: &RECT) -> Result<()> {
                 REG_DWORD,
                 Some(&p.horizontal_widgets_mode.to_le_bytes()),
             );
-            let _ = RegSetValueExW(
-                adv_key,
-                w!("ShowTaskViewButton"),
-                0,
-                REG_DWORD,
-                Some(&p.horizontal_task_view_mode.to_le_bytes()),
-            );
             if let Some(al) = b.taskbar_alignment {
                 let _ = RegSetValueExW(
                     adv_key,
@@ -538,6 +536,7 @@ pub fn restore_windows_baseline(primary_rect: &RECT) -> Result<()> {
                 );
             }
             let _ = RegCloseKey(adv_key);
+
         }
 
         if !b.stuck_rects3_binary.is_empty() && b.stuck_rects3_binary.len() >= 40 {

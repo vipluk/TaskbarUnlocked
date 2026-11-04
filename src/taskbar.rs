@@ -366,12 +366,23 @@ impl TaskbarState {
     pub fn broadcast_tray_settings() {
         use windows::Win32::Foundation::WPARAM;
         unsafe {
+            let tray_str = w!("TraySettings");
             let _ = SendNotifyMessageW(
                 HWND_BROADCAST,
                 WM_SETTINGCHANGE,
                 WPARAM(0),
-                LPARAM(w!("TraySettings").as_ptr() as isize),
+                LPARAM(tray_str.as_ptr() as isize),
             );
+            if let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) {
+                if !tray.0.is_null() {
+                    let _ = SendNotifyMessageW(
+                        tray,
+                        WM_SETTINGCHANGE,
+                        WPARAM(0),
+                        LPARAM(tray_str.as_ptr() as isize),
+                    );
+                }
+            }
         }
     }
 
@@ -409,28 +420,38 @@ impl TaskbarState {
                 );
 
                 if is_vertical {
-                    // W pionie nadpisujemy horizontal_search_mode tylko wtedy, gdy w rejestrze
-                    // faktycznie widnieje tryb poziomy (2 = etykieta, 3 = pole) lub 0 (ukryty).
-                    // Nigdy nie nadpisujemy trybu 2/3 wartością 1 (wymuszoną przez sam pion)!
+                    // Gdy przechodzimy z poziomu w pion (!last_applied_vertical),
+                    // zapisujemy aktualny wybór użytkownika z poziomu (0=ukryte, 1=ikona, 2=etykieta, 3=pole).
+                    // Jeśli już byliśmy w pionie, aktualizujemy horizontal_search_mode tylko gdy w rejestrze
+                    // pojawił się jawny tryb poziomy (2 lub 3).
                     if q_res.is_ok() {
-                        if current_mode == 2 || current_mode == 3 {
+                        if !storage.preferences.last_applied_vertical {
                             if storage.preferences.horizontal_search_mode != current_mode {
                                 storage.preferences.horizontal_search_mode = current_mode;
                                 storage_changed = true;
                             }
-                        } else if current_mode == 0 && !storage.preferences.last_applied_vertical {
-                            storage.preferences.horizontal_search_mode = 0;
+                        } else if (current_mode == 2 || current_mode == 3)
+                            && storage.preferences.horizontal_search_mode != current_mode
+                        {
+                            storage.preferences.horizontal_search_mode = current_mode;
                             storage_changed = true;
                         }
                     }
 
 
-                    let target_vertical_mode = if storage.preferences.horizontal_search_mode == 0 {
-                        0u32
-                    } else {
-                        1u32
+                    // Logika przejść dla pionu:
+                    // - jeśli użytkownik miał ukryte (0) -> w obu orientacjach ukryte (0)
+                    // - jeśli użytkownik miał ikonę (1) -> w obu orientacjach ikona (1)
+                    // - jeśli użytkownik miał pole (2 lub 3) -> w pionie ikona (1)
+                    let target_vertical_mode = match storage.preferences.horizontal_search_mode {
+                        0 => 0u32,
+                        1 => 1u32,
+                        _ => 1u32,
                     };
-                    storage.preferences.vertical_search_mode = target_vertical_mode;
+                    if storage.preferences.vertical_search_mode != target_vertical_mode {
+                        storage.preferences.vertical_search_mode = target_vertical_mode;
+                        storage_changed = true;
+                    }
 
                     if !q_res.is_ok() || current_mode != target_vertical_mode {
                         let _ = RegSetValueExW(
@@ -488,11 +509,13 @@ impl TaskbarState {
                     }
                 }
 
+
                 let _ = RegCloseKey(search_key);
             }
         }
         Self::adapt_widgets_for_edge(is_vertical, &mut storage, &mut reg_changed, &mut storage_changed);
     }
+
 
 
     fn adapt_widgets_for_edge(
@@ -706,7 +729,7 @@ impl TaskbarState {
                         0,
                         width,
                         height,
-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
                     );
                 }
             }
@@ -714,6 +737,7 @@ impl TaskbarState {
 
         Ok(())
     }
+
 
 
     pub fn hide_conflicting_secondary_tray(

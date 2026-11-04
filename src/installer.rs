@@ -449,10 +449,11 @@ fn restart_explorer() {
     let _ = std::process::Command::new("explorer.exe").spawn();
 }
 
-pub fn perform_uninstall() -> Result<()> {
+fn uninstall_internal(show_summary_dialog: bool) -> Result<()> {
     disable_legacy_v2_shm();
     kill_other_instances();
     std::thread::sleep(std::time::Duration::from_millis(150));
+
 
     let mut settings = load_persisted_settings();
     if let Ok(monitors) = enumerate_monitors() {
@@ -516,34 +517,59 @@ pub fn perform_uninstall() -> Result<()> {
         let _ = std::fs::remove_dir_all(&install_dir);
     }
 
-    let lang = detect_default_gui_lang();
-    let (title, body) = match lang {
-        GuiLang::Polish => (
-            "Zaawansowane ustawienia paska zadań — Odinstalowano",
-            "Aplikacja została pomyślnie odinstalowana.\n\n\
-             • Pasek zadań oraz obszary robocze ekranów zostały przywrócone na monitor główny.\n\
-             • Dodatkowa pozycja z menu kontekstowego paska zadań została usunięta.\n\
-             • Wpis autostartu systemu Windows został usunięty.",
-        ),
-        GuiLang::English => (
-            "Advanced Taskbar Settings — Uninstalled",
-            "The application has been successfully uninstalled.\n\n\
-             • The taskbar and screen work areas have been restored to the primary monitor.\n\
-             • The extra context menu item has been removed.\n\
-             • The Windows startup entry has been removed.",
-        ),
-    };
+    if show_summary_dialog {
+        let lang = detect_default_gui_lang();
+        let (title, body) = match lang {
+            GuiLang::Polish => (
+                "Zaawansowane ustawienia paska zadań — Odinstalowano",
+                "Aplikacja została pomyślnie odinstalowana.\n\n\
+                 • Pasek zadań oraz obszary robocze ekranów zostały przywrócone na monitor główny.\n\
+                 • Dodatkowa pozycja z menu kontekstowego paska zadań została usunięta.\n\
+                 • Wpis autostartu systemu Windows został usunięty.",
+            ),
+            GuiLang::English => (
+                "Advanced Taskbar Settings — Uninstalled",
+                "The application has been successfully uninstalled.\n\n\
+                 • The taskbar and screen work areas have been restored to the primary monitor.\n\
+                 • The extra context menu item has been removed.\n\
+                 • The Windows startup entry has been removed.",
+            ),
+        };
 
-    unsafe {
-        MessageBoxW(
-            HWND::default(),
-            PCWSTR(to_wide(body).as_ptr()),
-            PCWSTR(to_wide(title).as_ptr()),
-            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
-        );
+        unsafe {
+            MessageBoxW(
+                HWND::default(),
+                PCWSTR(to_wide(body).as_ptr()),
+                PCWSTR(to_wide(title).as_ptr()),
+                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+            );
+        }
     }
 
     Ok(())
+}
+
+pub fn perform_uninstall() -> Result<()> {
+    uninstall_internal(true)
+}
+
+pub fn perform_reinstall() -> Result<()> {
+    uninstall_internal(false)?;
+
+    for _ in 0..50 {
+        let tray_ready = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::FindWindowW(w!("Shell_TrayWnd"), None)
+                .map(|h| !h.0.is_null())
+                .unwrap_or(false)
+        };
+        if tray_ready {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    perform_install()
 }
 
 pub fn toggle_install_or_uninstall() -> Result<()> {
@@ -554,17 +580,17 @@ pub fn toggle_install_or_uninstall() -> Result<()> {
                 "Zaawansowane ustawienia paska zadań",
                 "Aplikacja TaskbarUnlocked jest już zainstalowana w systemie.\n\n\
                  Co chcesz zrobić?\n\n\
-                 • Kliknij [Tak], aby uruchomić / naprawić działanie paska zadań teraz.\n\
-                 • Kliknij [Nie], aby całkowicie odinstalować aplikację i przywrócić pasek zadań na monitor główny.\n\
-                 • Kliknij [Anuluj], aby nie wprowadzać żadnych zmian.",
+                 • Kliknij [Tak], aby przeinstalować aplikację (odinstalować starą wersję i zainstalować nową).\n\
+                 • Kliknij [Nie], aby całkowicie odinstalować aplikację i przywrócić pasek zadań.\n\
+                 • Kliknij [Anuluj], aby zamknąć to okno bez wprowadzania żadnych zmian.",
             ),
             GuiLang::English => (
                 "Advanced Taskbar Settings",
                 "TaskbarUnlocked is already installed on this system.\n\n\
                  What would you like to do?\n\n\
-                 • Click [Yes] to run / repair the taskbar now.\n\
-                 • Click [No] to completely uninstall the application and restore the taskbar to the primary display.\n\
-                 • Click [Cancel] to exit without making changes.",
+                 • Click [Yes] to reinstall the application (uninstall the old version and install the new one).\n\
+                 • Click [No] to completely uninstall the application and restore the taskbar.\n\
+                 • Click [Cancel] to close this window without making any changes.",
             ),
         };
 
@@ -578,7 +604,7 @@ pub fn toggle_install_or_uninstall() -> Result<()> {
         };
 
         match res {
-            IDYES => perform_install(),
+            IDYES => perform_reinstall(),
             IDNO => perform_uninstall(),
             _ => Ok(()),
         }
@@ -586,3 +612,4 @@ pub fn toggle_install_or_uninstall() -> Result<()> {
         perform_install()
     }
 }
+

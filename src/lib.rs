@@ -15,12 +15,13 @@ use windows::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE, PAG
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Shell::{ABM_QUERYPOS, ABM_SETPOS, APPBARDATA};
+use windows::Win32::UI::Shell::{ABM_GETTASKBARPOS, ABM_QUERYPOS, ABM_SETPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, FindWindowW, GetWindowLongPtrW, GetWindowThreadProcessId, IsChild, IsWindow,
-    SetWindowLongPtrW, GWLP_WNDPROC, HDWP, MONITORINFOF_PRIMARY, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS,
-    WM_WINDOWPOSCHANGING, WNDPROC,
+    CallWindowProcW, FindWindowW, GetClassNameW, GetCursorPos, GetWindowLongPtrW,
+    GetWindowThreadProcessId, IsChild, IsWindow, SetWindowLongPtrW, GWLP_WNDPROC, HDWP,
+    MONITORINFOF_PRIMARY, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS, WM_WINDOWPOSCHANGING, WNDPROC,
 };
+
 
 
 
@@ -282,6 +283,79 @@ unsafe extern "system" fn hooked_monitor_from_rect(
 }
 
 
+unsafe fn adjust_taskbar_popup_pos(
+    hwnd: HWND,
+    x: &mut i32,
+    y: &mut i32,
+    cx: i32,
+    cy: i32,
+    u_flags: u32,
+    cfg: &SharedConfig,
+) {
+    if (u_flags & SWP_NOMOVE.0) != 0 || !is_tray_thread() {
+        return;
+    }
+    let mut cls_buf = [0u16; 64];
+    let len = GetClassNameW(hwnd, &mut cls_buf) as usize;
+    if len == 0 {
+        return;
+    }
+    let cls = String::from_utf16_lossy(&cls_buf[..len]);
+    if cls != "Xaml_WindowedPopupClass" && cls != "TaskListThumbnailWnd" {
+        return;
+    }
+
+    let mut w = cx;
+    let mut h = cy;
+    if (u_flags & SWP_NOSIZE.0) != 0 || w <= 0 || h <= 0 {
+        let mut rc = RECT::default();
+        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rc).is_ok() {
+            w = rc.right - rc.left;
+            h = rc.bottom - rc.top;
+        }
+    }
+    if w <= 10 || h <= 10 {
+        return;
+    }
+
+    let tr = cfg.target_rect;
+    let tb = cfg.desired_taskbar_rect;
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+
+    match cfg.edge {
+        1 => {
+            if *y > tb.bottom + 40 {
+                *y = tb.bottom + 8;
+                let centered_x = pt.x - w / 2;
+                *x = centered_x.clamp(tr.left + 8, (tr.right - w - 8).max(tr.left + 8));
+            }
+        }
+        3 => {
+            if *y + h < tb.top - 40 {
+                *y = (tb.top - h - 8).max(tr.top + 8);
+                let centered_x = pt.x - w / 2;
+                *x = centered_x.clamp(tr.left + 8, (tr.right - w - 8).max(tr.left + 8));
+            }
+        }
+        0 => {
+            if *x > tb.right + 40 {
+                *x = tb.right + 8;
+                let centered_y = pt.y - h / 2;
+                *y = centered_y.clamp(tr.top + 8, (tr.bottom - h - 8).max(tr.top + 8));
+            }
+        }
+        2 => {
+            if *x + w < tb.left - 40 {
+                *x = (tb.left - w - 8).max(tr.left + 8);
+                let centered_y = pt.y - h / 2;
+                *y = centered_y.clamp(tr.top + 8, (tr.bottom - h - 8).max(tr.top + 8));
+            }
+        }
+        _ => {}
+    }
+}
+
 unsafe extern "system" fn hooked_set_window_pos(
     hwnd: HWND,
     hwnd_insert_after: HWND,
@@ -305,11 +379,14 @@ unsafe extern "system" fn hooked_set_window_pos(
             cx = cfg.desired_taskbar_rect.right - cfg.desired_taskbar_rect.left;
             cy = cfg.desired_taskbar_rect.bottom - cfg.desired_taskbar_rect.top;
             u_flags &= !(SWP_NOMOVE.0 | SWP_NOSIZE.0);
+        } else {
+            adjust_taskbar_popup_pos(hwnd, &mut x, &mut y, cx, cy, u_flags, &cfg);
         }
     }
     let orig: FnSetWindowPos = std::mem::transmute(detour.trampoline());
     orig(hwnd, hwnd_insert_after, x, y, cx, cy, u_flags)
 }
+
 
 unsafe extern "system" fn hooked_defer_window_pos(
     h_win_pos_info: HDWP,
@@ -335,6 +412,8 @@ unsafe extern "system" fn hooked_defer_window_pos(
             cx = cfg.desired_taskbar_rect.right - cfg.desired_taskbar_rect.left;
             cy = cfg.desired_taskbar_rect.bottom - cfg.desired_taskbar_rect.top;
             u_flags &= !(SWP_NOMOVE.0 | SWP_NOSIZE.0);
+        } else {
+            adjust_taskbar_popup_pos(hwnd, &mut x, &mut y, cx, cy, u_flags, &cfg);
         }
     }
     let orig: FnDeferWindowPos = std::mem::transmute(detour.trampoline());
@@ -363,21 +442,32 @@ unsafe extern "system" fn hooked_sh_appbar_message(
     };
     let orig: FnSHAppBarMessage = std::mem::transmute(detour.trampoline());
 
-    if !p_data.is_null() && (dw_message == ABM_QUERYPOS || dw_message == ABM_SETPOS) {
-        if let Some(cfg) = active_config() {
-            let tray = get_tray_hwnd();
-            if (*p_data).hWnd.0.is_null() || (*p_data).hWnd == tray {
+    if !p_data.is_null() {
+        if dw_message == ABM_GETTASKBARPOS {
+            if let Some(cfg) = active_config() {
+                let res = orig(dw_message, p_data);
                 (*p_data).uEdge = cfg.edge;
                 (*p_data).rc = cfg.desired_taskbar_rect;
-                let res = orig(dw_message, p_data);
-                (*p_data).rc = cfg.desired_taskbar_rect;
-                return res;
+                return if res != 0 { res } else { 1 };
+            }
+        } else if dw_message == ABM_QUERYPOS || dw_message == ABM_SETPOS {
+            if let Some(cfg) = active_config() {
+                let tray = get_tray_hwnd();
+                if (*p_data).hWnd.0.is_null() || (*p_data).hWnd == tray || is_tray_thread() {
+                    (*p_data).uEdge = cfg.edge;
+                    (*p_data).rc = cfg.desired_taskbar_rect;
+                    let res = orig(dw_message, p_data);
+                    (*p_data).uEdge = cfg.edge;
+                    (*p_data).rc = cfg.desired_taskbar_rect;
+                    return res;
+                }
             }
         }
     }
 
     orig(dw_message, p_data)
 }
+
 
 unsafe fn restore_export_prologue_if_hooked(hmod: HMODULE, fn_addr: usize) {
     if fn_addr == 0 || *(fn_addr as *const u8) != 0xE9 {

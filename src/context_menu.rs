@@ -521,7 +521,10 @@ unsafe fn scan_taskbar_view_and_install() -> Option<ContextMenuHooks> {
     let fn_create_item_addr = call_targets[1];
     let fn_append_addr = call_targets[2];
 
+    patch_vertical_search_icon_layout(text_start, text_len);
+
     restore_original_prologue_from_disk(hmod, base, text_va, text_raw_ptr, fn_create_item_addr);
+
     restore_original_prologue_from_disk(hmod, base, text_va, text_raw_ptr, fn_append_addr);
     restore_original_prologue_from_disk(hmod, base, text_va, text_raw_ptr, fn_settings_invoke_addr);
 
@@ -553,6 +556,97 @@ unsafe fn scan_taskbar_view_and_install() -> Option<ContextMenuHooks> {
     })
 }
 
+unsafe fn patch_vertical_search_icon_layout(text_start: usize, text_len: usize) {
+    let slice = std::slice::from_raw_parts(text_start as *const u8, text_len);
+
+    // 1. ExperienceToggleButton::UpdateColumnWidths:
+    // Wzorzec: 8B 8B 34 01 00 00 E8 ?? ?? ?? ?? 84 C0 0F 85 ?? ?? 00 00 83 BB 38 01 00 00 00 0F 84 ?? ?? 00 00
+    // Zamieniamy warunkowe `0F 84 <disp32>` (je IS_HORIZONTAL) na bezwarunkowe `E9 <disp32+1> 90` (jmp IS_HORIZONTAL; nop),
+    // aby w orientacji pionowej SearchButton otrzymywał IconColumnDefinition.Width = 1* tak samo jak StartButton i TaskViewButton.
+    for i in 0..slice.len().saturating_sub(32) {
+        if slice[i] == 0x8B
+            && slice[i + 1] == 0x8B
+            && slice[i + 2] == 0x34
+            && slice[i + 3] == 0x01
+            && slice[i + 4] == 0x00
+            && slice[i + 5] == 0x00
+            && slice[i + 6] == 0xE8
+            && slice[i + 11] == 0x84
+            && slice[i + 12] == 0xC0
+            && slice[i + 13] == 0x0F
+            && slice[i + 14] == 0x85
+            && slice[i + 19] == 0x83
+            && slice[i + 20] == 0xBB
+            && slice[i + 21] == 0x38
+            && slice[i + 22] == 0x01
+            && slice[i + 23] == 0x00
+            && slice[i + 24] == 0x00
+            && slice[i + 25] == 0x00
+            && slice[i + 26] == 0x0F
+            && slice[i + 27] == 0x84
+        {
+            let je_addr = text_start + i + 26;
+            let orig_disp = i32::from_le_bytes([
+                slice[i + 28],
+                slice[i + 29],
+                slice[i + 30],
+                slice[i + 31],
+            ]);
+            let jmp_disp = (orig_disp + 1).to_le_bytes();
+            let mut old_prot = PAGE_PROTECTION_FLAGS::default();
+            if VirtualProtect(
+                je_addr as *const c_void,
+                6,
+                PAGE_EXECUTE_READWRITE,
+                &mut old_prot,
+            )
+            .is_ok()
+            {
+                let patch: [u8; 6] = [0xE9, jmp_disp[0], jmp_disp[1], jmp_disp[2], jmp_disp[3], 0x90];
+                std::ptr::copy_nonoverlapping(patch.as_ptr(), je_addr as *mut u8, 6);
+                let _ = VirtualProtect(je_addr as *const c_void, 6, old_prot, &mut old_prot);
+            }
+        }
+    }
+
+    // 2. ExperienceToggleButton::UpdateButtonMetrics:
+    // Wzorzec: 48 8D 9F 58 04 00 00 83 BF 38 01 00 00 00 74 27
+    // Zamieniamy `74 27` (je +0x27) na `EB 27` (jmp +0x27), aby w pionie nie zerować marginesu ikony SearchButton.
+    for i in 0..slice.len().saturating_sub(18) {
+        if slice[i] == 0x48
+            && slice[i + 1] == 0x8D
+            && slice[i + 2] == 0x9F
+            && slice[i + 3] == 0x58
+            && slice[i + 4] == 0x04
+            && slice[i + 5] == 0x00
+            && slice[i + 6] == 0x00
+            && slice[i + 7] == 0x83
+            && slice[i + 8] == 0xBF
+            && slice[i + 9] == 0x38
+            && slice[i + 10] == 0x01
+            && slice[i + 11] == 0x00
+            && slice[i + 12] == 0x00
+            && slice[i + 13] == 0x00
+            && slice[i + 14] == 0x74
+            && slice[i + 15] == 0x27
+        {
+            let je_addr = text_start + i + 14;
+            let mut old_prot = PAGE_PROTECTION_FLAGS::default();
+            if VirtualProtect(
+                je_addr as *const c_void,
+                2,
+                PAGE_EXECUTE_READWRITE,
+                &mut old_prot,
+            )
+            .is_ok()
+            {
+                *(je_addr as *mut u8) = 0xEB;
+                let _ = VirtualProtect(je_addr as *const c_void, 2, old_prot, &mut old_prot);
+            }
+        }
+    }
+}
+
 pub fn init_context_menu_hooks() {
     if CTX_MENU_HOOKS.get().is_some() {
         return;
@@ -568,6 +662,7 @@ pub fn init_context_menu_hooks() {
         }
     }
 }
+
 
 
 

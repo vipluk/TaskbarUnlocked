@@ -16,6 +16,8 @@
 # Logs & temp
 *.log
 
-# Markdown files (keep only root README.md)
-*.md
-!README.md
+# Markdown files (ignore root scratch/plans, allow root README.md and docs directory)
+/*.md
+!/README.md
+!docs/
+!docs/**

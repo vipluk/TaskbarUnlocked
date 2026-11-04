@@ -284,7 +284,6 @@ fn apply_selected_settings(selected_monitor: usize, selected_edge: DockEdge, lan
     };
 
     TaskbarState::update_registry_taskbar_location(selected_edge);
-    TaskbarState::adapt_searchbox_for_edge(selected_edge);
 
     let mut tb_state = TaskbarState::locate(&target, cfg.edge, cfg.size_override)?;
     TaskbarState::update_registry_stuck_rects3(selected_edge, &tb_state.desired_rect);
@@ -301,7 +300,9 @@ fn apply_selected_settings(selected_monitor: usize, selected_edge: DockEdge, lan
     let _ = tb_state.hide_conflicting_secondary_tray(&target);
     tb_state.enforce_position()?;
     tb_state.notify_tray_layout_refresh();
+    TaskbarState::adapt_searchbox_for_edge(selected_edge);
     TaskbarState::update_work_areas(&primary, &target, &tb_state.desired_rect, cfg.edge)?;
+
 
     if let Ok(mut guard) = GUI_STATE.lock() {
         if let Some(st) = guard.as_mut() {

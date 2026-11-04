@@ -218,10 +218,12 @@ unsafe extern "system" fn hidden_wnd_proc(
                 }
             }
             if let Some((pm, tm, rc, edge)) = work_args {
+                TaskbarState::adapt_searchbox_for_edge(edge);
                 let _ = TaskbarState::update_work_areas(&pm, &tm, &rc, edge);
             }
             return LRESULT(0);
         } else if timer_id == TIMER_WATCHDOG_POLL {
+
             if STOP_REQUESTED.load(Ordering::SeqCst) {
                 PostQuitMessage(0);
                 return LRESULT(0);
@@ -324,6 +326,8 @@ fn rebind_taskbar(ctx: &mut GlobalWatcherContext) -> Result<()> {
     }
     new_state.enforce_position()?;
     new_state.notify_tray_layout_refresh();
+    TaskbarState::adapt_searchbox_for_edge(ctx.config.edge);
+
 
     // idThread = 0 monitoruje wszystkie wątki w procesie explorer.exe (w tym wątki XAML / Taskbar.View.dll)
 
@@ -576,7 +580,9 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
 
     unsafe {
         SetTimer(message_hwnd, TIMER_WATCHDOG_POLL, 150, None);
+        SetTimer(message_hwnd, TIMER_REASSERT_WORKAREA, 600, None);
     }
+
 
     {
         let mut guard = GLOBAL_CTX
@@ -656,7 +662,6 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
                 );
 
                 TaskbarState::update_registry_taskbar_location(new_edge);
-                TaskbarState::adapt_searchbox_for_edge(new_edge);
 
 
                 let mut post_work_args = None;
@@ -723,9 +728,11 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
                         }
                     }
                 }
+                TaskbarState::adapt_searchbox_for_edge(new_edge);
                 if let Some((pm, tm, rc, edge)) = post_work_args {
                     let _ = TaskbarState::update_work_areas(&pm, &tm, &rc, edge);
                 }
+
             }
         }
 
