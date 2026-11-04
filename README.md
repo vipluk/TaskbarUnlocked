@@ -1,9 +1,9 @@
-# 🔓 TaskbarUnlocked
+# TaskbarUnlocked 🔓
 
 [![Platform](https://img.shields.io/badge/Platform-Windows%2011-0078D4?logo=windows)](https://www.microsoft.com/windows)
-[![Tested On](https://img.shields.io/badge/Tested%20On-Win11%2026H2%20(26340.9767)-blue.svg)](#-tested-system-environment)
+[![Tested On](https://img.shields.io/badge/Tested%20On-Win11%2026H2%20(26340.9767)-blue.svg)](#tested-system-environment)
 [![Language](https://img.shields.io/badge/Language-Rust-DEA584?logo=rust)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](LICENSE)
 
 > **Unlock and freely drag the Windows 11 taskbar to any screen edge across all monitors.**
 
@@ -11,9 +11,7 @@ Windows 11 removed the ability to drag and position the taskbar to different edg
 
 ---
 
-## 📸 Screenshots & Previews
-
-<!-- Place your screenshots in docs/screenshots/ or replace the paths below -->
+## Previews
 
 | Taskbar Context Menu | Application Settings |
 | :---: | :---: |
@@ -22,20 +20,17 @@ Windows 11 removed the ability to drag and position the taskbar to different edg
 
 ---
 
-## ✨ Features
+## Features
 
-* 🖱️ **Free Drag & Drop:** Click and drag the taskbar directly between screen edges (Bottom, Top, Left, Right) with a smooth live docking preview overlay and a 24 px deadzone to prevent accidental drags.
-* 🖥️ **Full Multi-Monitor Freedom:** Relocate the primary taskbar to **any** display, not just the primary monitor, with EDID hardware monitor name detection.
-* 📌 **Native XAML Context Menu Integration:** Restores the classic *"Lock the taskbar"* toggle (with checkmark state) and *"Advanced taskbar settings"* directly inside the Windows 11 XAML right-click menu (localized across 38 Windows languages).
-* 🔍 **Smart Searchbox & Widgets Adaptation:** Automatically switches the Windows 11 Search box into a compact magnifying glass icon when docked vertically (fixing Microsoft's vertical XAML rendering bug in memory!) and restores your full Search box when docked horizontally.
-* ⚡ **Instant Logon Autostart:** Uses Windows Task Scheduler (`ONLOGON`) so the taskbar appears on your chosen monitor and edge immediately upon signing in.
-* 💾 **Faithful System Baseline & Clean Uninstall:** Snapshots your original Windows taskbar configuration (`StuckRects3`, Search mode, Widgets, alignment) to `Documents\TaskbarUnlocked\config.json` before first install and restores it 1:1 upon uninstallation.
-* 🦀 **Ultra Lightweight & Non-Destructive:** Crafted 100% in native **Rust** with direct Win32 API bindings. Zero Electron, zero web views, negligible RAM/CPU footprint, and **zero modified system files on disk**.
+* **Free Drag & Drop:** Click and drag the taskbar directly between screen edges (Bottom, Top, Left, Right) with a smooth live docking preview overlay and a 24 px deadzone to prevent accidental drags.
+* **Full Multi-Monitor Freedom:** Relocate the primary taskbar to **any** display, not just the primary monitor, with EDID hardware monitor name detection.
+* **Native XAML Context Menu Integration:** Restores the classic *"Lock the taskbar"* toggle (with checkmark state) and *"Advanced taskbar settings"* directly inside the Windows 11 XAML right-click menu (localized across 38 Windows languages).
+* **Ultra Lightweight & Non-Destructive:** Crafted 100% in native **Rust** with direct Win32 API bindings. Zero Electron, zero web views, negligible RAM/CPU footprint, and **zero modified system files on disk**.
 
 
 ---
 
-## 💻 Tested System Environment
+## Tested System Environment
 
 This application has been built and tested on the following system configuration:
 
@@ -52,7 +47,7 @@ This application has been built and tested on the following system configuration
 
 ---
 
-## 🚀 Quick Start & Installation
+## Installation
 
 ### Option 1: Single-File Interactive Installer (Recommended)
 1. Download the latest `taskbar-unlocked.exe` from the [Releases](../../releases) tab (the hook DLL is embedded directly inside the `.exe`).
@@ -91,51 +86,7 @@ You can also control `taskbar-unlocked.exe` via CLI flags:
 
 ---
 
-## 🔬 Under the Hood: Why Windows 11 Breaks the Vertical Search Icon
-
-Ever wondered why forcing the Windows 11 taskbar into a vertical orientation (Left/Right) leaves an empty **48×44 px black hole** right below the Start button instead of the Search magnifying glass icon?
-
-During the development of **TaskbarUnlocked**, we reverse-engineered `Taskbar.View.dll` (`ExperienceToggleButton.cpp` & `SearchBoxButton.cpp`) and found the exact bug left behind by Microsoft when transitioning from Windows 10X to Windows 11.
-
-> 📖 **Want the full engineering breakdown?** Read our complete [**Technical Deep Dive (`docs/TECHNICAL_DEEP_DIVE.md`)**](docs/TECHNICAL_DEEP_DIVE.md) covering the x86_64 disassembly, XAML `MenuFlyout` COM vtable hooking, thread-isolated monitor spoofing, and `SHAppBarMessage` interception.
-
-<details>
-<summary><b>🔍 Click to expand the assembly & XAML root-cause summary</b></summary>
-<br>
-
-In Windows 11, all three system buttons (`StartButton`, `SearchButton`, and `TaskViewButton`) inherit from the same C++ class inside `Taskbar.View.dll`: **`Taskbar::ExperienceToggleButton`**.
-
-When the taskbar orientation changes, `ExperienceToggleButton::UpdateColumnWidths` (`RVA 0x67593B`) calculates the width of the button's `IconColumnDefinition`:
-
-```cpp
-// Reconstructed logic from Taskbar.View.dll (ExperienceToggleButton::UpdateColumnWidths)
-if (IsHorizontalTaskbar(this->m_taskbarEdge) || this->m_searchMode == 0) {
-    // Working path (used by StartButton & TaskViewButton where m_searchMode == 0,
-    // and by all buttons on a horizontal taskbar):
-    this->m_iconColumnDefinition.Width(GridLength(1.0, GridUnitType::Star));
-    this->m_labelColumnDefinition.Width(GridLength(0.0, GridUnitType::Pixel));
-} else {
-    // Broken legacy path (only hit when the taskbar is VERTICAL and m_searchMode != 0):
-    double iconWidth = std::max(0.0, this->m_verticalWidth - this->m_marginLeft - this->m_marginRight);
-    this->m_iconColumnDefinition.Width(GridLength(iconWidth, GridUnitType::Pixel));
-}
-```
-
-#### Why does only the Search icon disappear?
-1. For **`StartButton`** and **`TaskViewButton`**, the field `m_searchMode` (`[rbx + 0x138]`) is always `0`. Even on a vertical taskbar (`IsHorizontalTaskbar == false`), they take the first branch and set `IconColumnDefinition.Width = 1*` (filling the full 48 px width).
-2. For **`SearchButton`** (in icon-only mode, `SearchboxTaskbarMode = 1`), `m_searchMode` is `1`. When docked vertically (`ABE_LEFT` or `ABE_RIGHT`), it is the **only button on the entire taskbar** that enters the `else` branch.
-3. However, when Microsoft introduced the modern *Wave3 SearchBox* (`SearchBoxButton::UpdateButtonMetrics`), they only populated the horizontal width field (`[rbx + 0xF8] = 40.0`) and left the legacy vertical width field (`[rbx + 0xF0]`) **uninitialized at `0.0`**!
-4. As a result, `max(0.0, 0.0 - margins)` evaluates to **`0.0`**, and Windows 11 explicitly sets the Search icon column width to **`0 px`** — crushing the `AnimatedVisualPlayer` magnifying glass into invisibility while the `48×44 px` button container remains on screen as an empty gap.
-
-#### How TaskbarUnlocked fixes it in memory:
-Without touching a single file on disk, `taskbar_unlocked_hook.dll` dynamically scans the `.text` section of `Taskbar.View.dll` in `explorer.exe` for the `UpdateColumnWidths` & `UpdateButtonMetrics` byte signatures and patches the conditional jump (`0F 84` -> `E9`), routing `SearchButton` through the same `GridLength(1.0, Star)` layout path used by `StartButton`.
-
-</details>
-
-
----
-
-## 🛠️ Building from Source
+## Building from Source
 
 Prerequisites:
 * [Rust](https://rustup.rs/) (stable toolchain)
@@ -143,7 +94,7 @@ Prerequisites:
 
 ```powershell
 # 1. Clone the repository
-git clone https://github.com/<your-username>/TaskbarUnlocked.git
+git clone https://github.com/vipluk/TaskbarUnlocked.git
 cd TaskbarUnlocked
 
 # 2. Build the hook DLL and the main executable (Release mode)
@@ -157,7 +108,7 @@ cargo build --release --bin taskbar-unlocked
 
 ---
 
-## ⚖️ Legal Disclaimer
+## Legal Disclaimer
 
 > **IMPORTANT:**  
 > **TaskbarUnlocked** is an independent open-source project and is **not** affiliated with, sponsored by, authorized by, maintained by, or endorsed by **Microsoft Corporation** or any of its subsidiaries or affiliates.  
@@ -166,7 +117,7 @@ cargo build --release --bin taskbar-unlocked
 
 ---
 
-## 📜 License
+## License
 
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for full details.
+This project is licensed under the **GNU General Public License v2.0 (GPL-2.0)** - see the [LICENSE](LICENSE) file for full details.
 
