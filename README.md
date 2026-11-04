@@ -88,6 +88,10 @@ You can also control `taskbar-unlocked.exe` via CLI flags:
 
 If you want to report a bug, suggest new features, ask questions, or chat about the project, join our [Discord server](https://discord.gg/A7WVnYj3BP).
 
+If you enjoy **TaskbarUnlocked** and want to support its continued development:
+
+<a href='https://ko-fi.com/vipluk' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://ko-fi.com/img/githubbutton_sm.svg' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
+
 ---
 
 ## Building from Source
