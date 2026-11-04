@@ -152,8 +152,9 @@ fn spawn_gui_process() {
                 return candidate.to_string_lossy().into_owned();
             }
         }
-        r"C:\Users\vipluk\.gemini\antigravity-ide\scratch\win11-taskbar-unpinner\target\release\taskbar-unlocked.exe"
-            .to_string()
+        std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "taskbar-unlocked.exe".to_string())
     });
 
 
