@@ -10,7 +10,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, FindWindowExW, GetClientRect, GetCursorPos, GetWindowRect,
     RegisterClassW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow, HWND_TOPMOST, LWA_ALPHA,
@@ -117,6 +117,7 @@ enum DragPhase {
 pub struct TaskbarDragController {
     phase: DragPhase,
     overlay_hwnd: HWND,
+    prev_lbutton_down: bool,
 }
 
 impl TaskbarDragController {
@@ -154,6 +155,7 @@ impl TaskbarDragController {
         Self {
             phase: DragPhase::Idle,
             overlay_hwnd,
+            prev_lbutton_down: false,
         }
     }
 
@@ -189,9 +191,7 @@ impl TaskbarDragController {
         pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom
     }
 
-    #[allow(dead_code)]
     fn is_point_on_start_or_tray_notify(tray_hwnd: HWND, pt: POINT) -> bool {
-
         unsafe {
             for class_name in [w!("Start"), w!("TrayNotifyWnd")] {
                 if let Ok(child) = FindWindowExW(tray_hwnd, HWND::default(), class_name, None) {
@@ -262,27 +262,46 @@ impl TaskbarDragController {
         Some((mon.index, best_edge, preview_rc))
     }
 
-    pub fn poll_step(&mut self, tray_hwnd: HWND, locked: bool) -> Option<(usize, DockEdge)> {
+    pub fn poll_step(
+        &mut self,
+        tray_hwnd: HWND,
+        current_monitor: usize,
+        current_edge: DockEdge,
+        locked: bool,
+    ) -> Option<(usize, DockEdge)> {
+        let lbutton_down = (unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16 & 0x8000) != 0;
+
         if locked {
             if self.phase != DragPhase::Idle {
                 self.phase = DragPhase::Idle;
                 self.hide_overlay();
             }
+            self.prev_lbutton_down = lbutton_down;
             return None;
         }
 
-        let lbutton_down = (unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16 & 0x8000) != 0;
+        let esc_down = (unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } as u16 & 0x8000) != 0;
+        if esc_down && self.phase != DragPhase::Idle {
+            self.phase = DragPhase::Idle;
+            self.hide_overlay();
+            self.prev_lbutton_down = lbutton_down;
+            return None;
+        }
+
         let mut pt = POINT::default();
         if unsafe { GetCursorPos(&mut pt) }.is_err() {
+            self.prev_lbutton_down = lbutton_down;
             return None;
         }
 
-        match self.phase {
+        let result = match self.phase {
             DragPhase::Idle => {
-                if lbutton_down {
+                let just_pressed = lbutton_down && !self.prev_lbutton_down;
+                if just_pressed {
                     let mut tray_rc = RECT::default();
                     if unsafe { GetWindowRect(tray_hwnd, &mut tray_rc) }.is_ok()
                         && Self::point_in_rect(pt, &tray_rc)
+                        && !Self::is_point_on_start_or_tray_notify(tray_hwnd, pt)
                     {
                         self.phase = DragPhase::PressedOnTaskbar {
                             origin: pt,
@@ -293,28 +312,35 @@ impl TaskbarDragController {
                 None
             }
 
-            DragPhase::PressedOnTaskbar { origin, .. } => {
+            DragPhase::PressedOnTaskbar { origin, tray_rect } => {
                 if !lbutton_down {
                     self.phase = DragPhase::Idle;
-                    return None;
-                }
-                let dx = (pt.x - origin.x).abs();
-                let dy = (pt.y - origin.y).abs();
-                if dx >= 14 || dy >= 14 {
-                    if let Ok(monitors) = enumerate_monitors() {
-                        if let Some((mon_idx, edge, preview_rc)) =
-                            Self::pick_monitor_and_edge(pt, &monitors)
-                        {
-                            self.phase = DragPhase::Dragging {
-                                candidate_monitor: mon_idx,
-                                candidate_edge: edge,
-                            };
-                            self.show_overlay_at(&preview_rc);
+                    None
+                } else {
+                    let dx = (pt.x - origin.x).abs();
+                    let dy = (pt.y - origin.y).abs();
+                    let outside_taskbar = !Self::point_in_rect(pt, &tray_rect);
+                    if dx >= 24 || dy >= 24 || outside_taskbar {
+                        if let Ok(monitors) = enumerate_monitors() {
+                            if let Some((mon_idx, edge, preview_rc)) =
+                                Self::pick_monitor_and_edge(pt, &monitors)
+                            {
+                                self.phase = DragPhase::Dragging {
+                                    candidate_monitor: mon_idx,
+                                    candidate_edge: edge,
+                                };
+                                if mon_idx == current_monitor && edge == current_edge {
+                                    self.hide_overlay();
+                                } else {
+                                    self.show_overlay_at(&preview_rc);
+                                }
+                            }
                         }
                     }
+                    None
                 }
-                None
             }
+
             DragPhase::Dragging {
                 candidate_monitor,
                 candidate_edge,
@@ -324,11 +350,18 @@ impl TaskbarDragController {
                         if let Some((mon_idx, edge, preview_rc)) =
                             Self::pick_monitor_and_edge(pt, &monitors)
                         {
-                            if mon_idx != candidate_monitor || edge != candidate_edge {
+                            let candidate_changed =
+                                mon_idx != candidate_monitor || edge != candidate_edge;
+                            if candidate_changed {
                                 self.phase = DragPhase::Dragging {
                                     candidate_monitor: mon_idx,
                                     candidate_edge: edge,
                                 };
+                            }
+
+                            if mon_idx == current_monitor && edge == current_edge {
+                                self.hide_overlay();
+                            } else if candidate_changed {
                                 self.show_overlay_at(&preview_rc);
                             }
                         }
@@ -337,10 +370,17 @@ impl TaskbarDragController {
                 } else {
                     self.phase = DragPhase::Idle;
                     self.hide_overlay();
-                    Some((candidate_monitor, candidate_edge))
+                    if candidate_monitor == current_monitor && candidate_edge == current_edge {
+                        None
+                    } else {
+                        Some((candidate_monitor, candidate_edge))
+                    }
                 }
             }
-        }
+        };
+
+        self.prev_lbutton_down = lbutton_down;
+        result
     }
 }
 

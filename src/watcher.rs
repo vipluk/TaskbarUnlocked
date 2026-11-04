@@ -623,7 +623,7 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
             break;
         }
 
-        let mut tray_info: Option<(HWND, bool)> = None;
+        let mut tray_info: Option<(HWND, usize, crate::monitor::DockEdge, bool)> = None;
         if let Ok(guard) = GLOBAL_CTX.lock() {
             if let Some(ctx) = guard.as_ref() {
                 let is_locked = ctx
@@ -631,12 +631,19 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
                     .read()
                     .map(|c| c.locked != 0)
                     .unwrap_or(false);
-                tray_info = Some((ctx.state.main_tray_hwnd, is_locked));
+                tray_info = Some((
+                    ctx.state.main_tray_hwnd,
+                    ctx.config.target_monitor_index,
+                    ctx.config.edge,
+                    is_locked,
+                ));
             }
         }
 
-        if let Some((tray_hwnd, is_locked)) = tray_info {
-            if let Some((new_mon_idx, new_edge)) = drag_ctrl.poll_step(tray_hwnd, is_locked) {
+        if let Some((tray_hwnd, cur_mon, cur_edge, is_locked)) = tray_info {
+            if let Some((new_mon_idx, new_edge)) =
+                drag_ctrl.poll_step(tray_hwnd, cur_mon, cur_edge, is_locked)
+            {
                 let prev = crate::installer::load_persisted_settings();
                 crate::installer::save_persisted_settings(
                     &crate::installer::PersistedSettings {
