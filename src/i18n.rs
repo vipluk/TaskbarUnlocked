@@ -82,22 +82,15 @@ pub fn get_gui_strings(lang: GuiLang) -> &'static GuiStrings {
 #[allow(dead_code)]
 pub fn detect_default_gui_lang() -> GuiLang {
     let lang_id = unsafe { GetUserDefaultUILanguage() };
-    if (lang_id & 0x03FF) == 0x15 {
-        GuiLang::Polish
-    } else {
-        GuiLang::English
+    let primary_lang = lang_id & 0x03FF;
+    match primary_lang {
+        0x15 => GuiLang::Polish,
+        _ => GuiLang::English,
     }
 }
 
 #[allow(dead_code)]
-pub fn get_context_menu_label(lang_mode: u32) -> &'static str {
-
-    match lang_mode {
-        1 => return "Zaawansowane ustawienia paska zadań",
-        2 => return "Advanced taskbar settings",
-        _ => {}
-    }
-
+pub fn get_context_menu_label() -> &'static str {
     let lang_id = unsafe { GetUserDefaultUILanguage() };
     let primary_lang = lang_id & 0x03FF;
     let sub_lang = (lang_id >> 10) & 0x3F;
@@ -150,13 +143,7 @@ pub fn get_context_menu_label(lang_mode: u32) -> &'static str {
 }
 
 #[allow(dead_code)]
-pub fn get_lock_taskbar_label(lang_mode: u32) -> &'static str {
-    match lang_mode {
-        1 => return "Zablokuj pasek zadań",
-        2 => return "Lock the taskbar",
-        _ => {}
-    }
-
+pub fn get_lock_taskbar_label() -> &'static str {
     let lang_id = unsafe { GetUserDefaultUILanguage() };
     let primary_lang = lang_id & 0x03FF;
     let sub_lang = (lang_id >> 10) & 0x3F;

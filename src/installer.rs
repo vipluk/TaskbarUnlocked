@@ -13,8 +13,8 @@ use windows::Win32::System::Registry::{
 };
 
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetCurrentProcessId, OpenProcess, TerminateProcess, CREATE_NO_WINDOW,
-    PROCESS_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW,
+    CreateProcessW, GetCurrentProcessId, OpenProcess, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, PROCESS_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, STARTUPINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDNO, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND,
@@ -48,8 +48,8 @@ impl Default for PersistedSettings {
         Self {
             active: true,
             locked: false,
-            monitor_index: 1,
-            edge: DockEdge::Right,
+            monitor_index: 0,
+            edge: DockEdge::Bottom,
             lang_mode: 0,
         }
     }
@@ -176,7 +176,7 @@ pub fn load_persisted_settings() -> PersistedSettings {
                 1 => DockEdge::Top,
                 2 => DockEdge::Right,
                 3 => DockEdge::Bottom,
-                _ => DockEdge::Right,
+                _ => DockEdge::Bottom,
             });
             let reg_lang = read_dword(w!("LangMode"));
 
@@ -338,6 +338,16 @@ pub fn perform_install() -> Result<()> {
     }
 
     let mut initial_settings = load_persisted_settings();
+    if fresh_install {
+        if let Ok(monitors) = enumerate_monitors() {
+            if let Ok(primary) = get_primary_monitor(&monitors) {
+                let disk_storage = crate::storage::load_or_init_storage();
+                let native_edge = crate::storage::native_edge(&disk_storage.baseline, &primary.monitor_rect);
+                initial_settings.edge = native_edge;
+                initial_settings.monitor_index = primary.index;
+            }
+        }
+    }
     initial_settings.active = true;
     save_persisted_settings(&initial_settings);
 
@@ -421,6 +431,7 @@ fn restart_explorer() {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
+    let mut handles = Vec::new();
     if unsafe { Process32FirstW(snap, &mut pe) }.is_ok() {
         loop {
             let nul_pos = pe
@@ -430,11 +441,17 @@ fn restart_explorer() {
                 .unwrap_or(pe.szExeFile.len());
             let name = String::from_utf16_lossy(&pe.szExeFile[..nul_pos]).to_ascii_lowercase();
             if name == "explorer.exe" {
-                if let Ok(hp) = unsafe { OpenProcess(PROCESS_TERMINATE, false, pe.th32ProcessID) } {
+                if let Ok(hp) = unsafe {
+                    OpenProcess(
+                        PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                        false,
+                        pe.th32ProcessID,
+                    )
+                } {
                     unsafe {
                         let _ = TerminateProcess(hp, 0);
-                        let _ = CloseHandle(hp);
                     }
+                    handles.push(hp);
                 }
             }
             if unsafe { Process32NextW(snap, &mut pe) }.is_err() {
@@ -444,6 +461,12 @@ fn restart_explorer() {
     }
     unsafe {
         let _ = CloseHandle(snap);
+    }
+    for hp in handles {
+        unsafe {
+            let _ = WaitForSingleObject(hp, 3500);
+            let _ = CloseHandle(hp);
+        }
     }
     std::thread::sleep(std::time::Duration::from_millis(600));
     let _ = std::process::Command::new("explorer.exe").spawn();
@@ -554,9 +577,11 @@ pub fn perform_uninstall() -> Result<()> {
 }
 
 pub fn perform_reinstall() -> Result<()> {
+    // 1. KROK 1: Dosłowne, pełne odinstalowanie poprzedniej instalacji
     uninstall_internal(false)?;
 
-    for _ in 0..50 {
+    // 2. KROK 2: Bezpieczna przerwa i oczekiwanie na gotowość powłoki
+    for _ in 0..100 {
         let tray_ready = unsafe {
             windows::Win32::UI::WindowsAndMessaging::FindWindowW(w!("Shell_TrayWnd"), None)
                 .map(|h| !h.0.is_null())
@@ -567,8 +592,10 @@ pub fn perform_reinstall() -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    // Dodatkowa solidna przerwa na załadowanie podsystemów XAML i powłoki Windows 11
+    std::thread::sleep(std::time::Duration::from_millis(1500));
 
+    // 3. KROK 3: Czysta, świeża instalacja od zera
     perform_install()
 }
 

@@ -1,6 +1,10 @@
 pub mod context_menu;
+pub mod daemon_log;
 pub mod i18n;
 pub mod ipc;
+pub mod monitor;
+pub mod storage;
+pub mod taskbar;
 
 
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
@@ -103,6 +107,9 @@ unsafe extern "system" fn hooked_tray_wnd_proc(
 fn ensure_tray_subclassed(tray: HWND) {
     if tray.0.is_null() {
         return;
+    }
+    if !crate::context_menu::is_context_menu_hooked() {
+        crate::context_menu::init_context_menu_hooks();
     }
     let key = tray.0 as isize;
     if SUBCLASSED_TRAY_HWND.load(Ordering::Acquire) == key {
@@ -612,17 +619,19 @@ pub unsafe extern "system" fn DllMain(
 ) -> BOOL {
     if fdw_reason == DLL_PROCESS_ATTACH {
         std::thread::spawn(|| {
+            crate::daemon_log::log_line("[hook] DllMain: DLL_PROCESS_ATTACH w explorer.exe");
             if HOOKS.get().is_none() {
                 if let Some(table) = unsafe { install_all_hooks() } {
                     let _ = HOOKS.set(table);
                     enable_installed_hooks();
+                    crate::daemon_log::log_line("[hook] Główne hooki Win32 (Monitor/SetWindowPos) zainstalowane pomyślnie.");
+                } else {
+                    crate::daemon_log::log_line("[hook] BŁĄD: install_all_hooks zwróciło None");
                 }
             }
             let _ = get_tray_hwnd();
             crate::context_menu::init_context_menu_hooks();
         });
-
-
     }
     BOOL::from(true)
 }

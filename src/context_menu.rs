@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 use retour::RawDetour;
@@ -268,13 +268,13 @@ unsafe extern "system" fn hooked_ivector_append(
 
     let should_append_custom = APPEND_AFTER_SETTINGS_ITEM.with(|f| f.replace(false));
     if should_append_custom {
-        let (enabled, locked, lang_mode, _) = read_context_menu_config_from_shm();
+        let (enabled, locked, _lang_mode, _) = read_context_menu_config_from_shm();
         if !enabled {
             return res;
         }
 
         // 1. Pozycja "Zablokuj pasek zadań" (między Ustawienia paska zadań a Zaawansowane ustawienia paska zadań)
-        let lock_label = get_lock_taskbar_label(lang_mode);
+        let lock_label = get_lock_taskbar_label();
         let lock_glyph = if locked {
             GLYPH_LOCK_CHECKMARK
         } else {
@@ -290,7 +290,7 @@ unsafe extern "system" fn hooked_ivector_append(
         );
 
         // 2. Pozycja "Zaawansowane ustawienia paska zadań" na samym dole
-        let adv_label = get_context_menu_label(lang_mode);
+        let adv_label = get_context_menu_label();
         create_and_append_custom_item(
             hooks,
             orig_append,
@@ -375,25 +375,18 @@ unsafe fn restore_original_prologue_from_disk(
 
 
 unsafe fn scan_taskbar_view_and_install() -> Option<ContextMenuHooks> {
-    let mut hmod = GetModuleHandleW(w!("Taskbar.View.dll")).ok()?;
-    if hmod.0.is_null() {
-        for _ in 0..25 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            if let Ok(m) = GetModuleHandleW(w!("Taskbar.View.dll")) {
-                if !m.0.is_null() {
-                    hmod = m;
-                    break;
-                }
-            }
-        }
-    }
-    if hmod.0.is_null() {
-        return None;
-    }
+    let hmod = match GetModuleHandleW(w!("Taskbar.View.dll")) {
+        Ok(m) if !m.0.is_null() => m,
+        _ => return None,
+    };
+    crate::daemon_log::log_line("[ctx_menu] Wykryto Taskbar.View.dll w explorer.exe! Rozpoczynanie skanowania...");
 
     let base = hmod.0 as usize;
+    crate::daemon_log::log_line(format!("[ctx_menu] Znaleziono Taskbar.View.dll pod adresem bazowym 0x{:X}", base));
+
     let dos_magic = *(base as *const u16);
     if dos_magic != 0x5A4D {
+        crate::daemon_log::log_line("[ctx_menu] BŁĄD: Niepoprawny nagłówek DOS (brak sygnatury MZ)");
         return None;
     }
 
@@ -418,9 +411,20 @@ unsafe fn scan_taskbar_view_and_install() -> Option<ContextMenuHooks> {
         }
     }
 
-    let (text_start, text_len, text_va, text_raw_ptr) = text_range?;
-    let (rdata_start, rdata_len) = rdata_range?;
-
+    let (text_start, text_len, text_va, text_raw_ptr) = match text_range {
+        Some(t) => t,
+        None => {
+            crate::daemon_log::log_line("[ctx_menu] BŁĄD: Nie znaleziono sekcji .text");
+            return None;
+        }
+    };
+    let (rdata_start, rdata_len) = match rdata_range {
+        Some(r) => r,
+        None => {
+            crate::daemon_log::log_line("[ctx_menu] BŁĄD: Nie znaleziono sekcji .rdata");
+            return None;
+        }
+    };
 
     let text_bytes = std::slice::from_raw_parts(text_start as *const u8, text_len);
     let rdata_bytes = std::slice::from_raw_parts(rdata_start as *const u8, rdata_len);
@@ -429,15 +433,25 @@ unsafe fn scan_taskbar_view_and_install() -> Option<ContextMenuHooks> {
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .collect();
-    let str_off = find_subslice(rdata_bytes, &needle_utf16)?;
+    let str_off = match find_subslice(rdata_bytes, &needle_utf16) {
+        Some(o) => o,
+        None => {
+            crate::daemon_log::log_line("[ctx_menu] BŁĄD: Nie znaleziono ciągu 'TaskbarSettingsContextMenuItemText' w .rdata");
+            return None;
+        }
+    };
     let str_addr = (rdata_start + str_off) as u64;
 
-    let ptr_off = find_subslice(rdata_bytes, &str_addr.to_le_bytes())?;
-    let ptr_struct_addr = rdata_start + ptr_off;
+    let ptr_struct_addr = find_subslice(rdata_bytes, &str_addr.to_le_bytes())
+        .map(|off| rdata_start + off);
 
     let mut lea_addr: Option<usize> = None;
     for pos in 0..text_len.saturating_sub(7) {
-        if text_bytes[pos] == 0x4C && text_bytes[pos + 1] == 0x8D && text_bytes[pos + 2] == 0x05 {
+        // Sprawdź czy to instrukcja LEA z adresowaniem RIP-relative (ModR/M & 0xC7 == 0x05)
+        let is_lea_rip = (text_bytes[pos] == 0x4C || text_bytes[pos] == 0x48)
+            && text_bytes[pos + 1] == 0x8D
+            && (text_bytes[pos + 2] & 0xC7 == 0x05);
+        if is_lea_rip {
             let disp = i32::from_le_bytes([
                 text_bytes[pos + 3],
                 text_bytes[pos + 4],
@@ -446,22 +460,41 @@ unsafe fn scan_taskbar_view_and_install() -> Option<ContextMenuHooks> {
             ]);
             let rip = text_start + pos + 7;
             let target = (rip as isize + disp as isize) as usize;
-            if target == ptr_struct_addr {
+            if Some(target) == ptr_struct_addr || target == (str_addr as usize) {
                 lea_addr = Some(text_start + pos);
                 break;
             }
         }
     }
-    let lea_addr = lea_addr?;
 
-    let back_start = lea_addr.saturating_sub(96);
+    let lea_addr = match lea_addr {
+        Some(a) => a,
+        None => {
+            crate::daemon_log::log_line(format!(
+                "[ctx_menu] BŁĄD: Nie znaleziono instrukcji LEA odwołującej się do str_addr (0x{:X}) ani ptr_struct ({:?})",
+                str_addr, ptr_struct_addr.map(|p| format!("0x{:X}", p))
+            ));
+            return None;
+        }
+    };
+
+    crate::daemon_log::log_line(format!("[ctx_menu] Znaleziono LEA pod adresem 0x{:X}", lea_addr));
+
+    let back_start = lea_addr.saturating_sub(160);
     let back_slice = std::slice::from_raw_parts(back_start as *const u8, lea_addr - back_start);
 
     let mut fn_operator_new_addr: Option<usize> = None;
     let mut vtable_delegate_addr: Option<usize> = None;
 
     for pos in 0..back_slice.len().saturating_sub(10) {
-        if back_slice[pos..pos + 5] == [0xB9, 0x10, 0x00, 0x00, 0x00] && back_slice[pos + 5] == 0xE8
+        // Dopasuj alokację pamięci pod delegata: B9 <size> 00 00 00 E8 <disp32>
+        // Rozmiar struktury delegata może wynosić 16..64 bajty w zależności od kompilacji MSVC
+        if back_slice[pos] == 0xB9
+            && (back_slice[pos + 1] >= 0x08 && back_slice[pos + 1] <= 0x60)
+            && back_slice[pos + 2] == 0x00
+            && back_slice[pos + 3] == 0x00
+            && back_slice[pos + 4] == 0x00
+            && back_slice[pos + 5] == 0xE8
         {
             let disp = i32::from_le_bytes([
                 back_slice[pos + 6],
@@ -470,14 +503,18 @@ unsafe fn scan_taskbar_view_and_install() -> Option<ContextMenuHooks> {
                 back_slice[pos + 9],
             ]);
             let rip = back_start + pos + 10;
-            fn_operator_new_addr = Some((rip as isize + disp as isize) as usize);
+            let target = (rip as isize + disp as isize) as usize;
+            if target >= text_start && target < text_start + text_len {
+                fn_operator_new_addr = Some(target);
+            }
         }
+
+        // Dopasuj ustawienie vtable delegata:
+        // 48 8D 0D <disp32> (lea rcx, [rip+vtable]) followed by 48 89 <reg> (mov [ptr], rcx)
         if back_slice[pos] == 0x48
             && back_slice[pos + 1] == 0x8D
             && back_slice[pos + 2] == 0x0D
-            && back_slice[pos + 7] == 0x48
-            && back_slice[pos + 8] == 0x89
-            && back_slice[pos + 9] == 0x08
+            && (pos + 8 < back_slice.len() && back_slice[pos + 7] == 0x48 && back_slice[pos + 8] == 0x89)
         {
             let disp = i32::from_le_bytes([
                 back_slice[pos + 3],
@@ -486,16 +523,37 @@ unsafe fn scan_taskbar_view_and_install() -> Option<ContextMenuHooks> {
                 back_slice[pos + 6],
             ]);
             let rip = back_start + pos + 7;
-            vtable_delegate_addr = Some((rip as isize + disp as isize) as usize);
+            let target = (rip as isize + disp as isize) as usize;
+            if target >= rdata_start && target < rdata_start + rdata_len {
+                vtable_delegate_addr = Some(target);
+            }
         }
     }
 
-    let fn_operator_new_addr = fn_operator_new_addr?;
-    let vtable_delegate_addr = vtable_delegate_addr?;
+    let fn_operator_new_addr = match fn_operator_new_addr {
+        Some(a) => a,
+        None => {
+            crate::daemon_log::log_line("[ctx_menu] BŁĄD: Nie znaleziono wywołania operator new w sekcji poprzedzającej");
+            return None;
+        }
+    };
+
+    let vtable_delegate_addr = match vtable_delegate_addr {
+        Some(a) => a,
+        None => {
+            crate::daemon_log::log_line("[ctx_menu] BŁĄD: Nie znaleziono adresu vtable delegata w sekcji poprzedzającej");
+            return None;
+        }
+    };
+
     let fn_settings_invoke_addr = *((vtable_delegate_addr as *const usize).add(3));
+    crate::daemon_log::log_line(format!(
+        "[ctx_menu] operator_new: 0x{:X}, vtable_delegate: 0x{:X}, settings_invoke: 0x{:X}",
+        fn_operator_new_addr, vtable_delegate_addr, fn_settings_invoke_addr
+    ));
 
     let fwd_start = lea_addr + 7;
-    let fwd_slice = std::slice::from_raw_parts(fwd_start as *const u8, 120);
+    let fwd_slice = std::slice::from_raw_parts(fwd_start as *const u8, 160);
     let mut call_targets: Vec<usize> = Vec::new();
 
     for pos in 0..fwd_slice.len().saturating_sub(5) {
@@ -514,38 +572,127 @@ unsafe fn scan_taskbar_view_and_install() -> Option<ContextMenuHooks> {
         }
     }
 
-    if call_targets.len() < 3 {
-        return None;
+    // Strategia detekcji CreateMenuFlyoutItem i IVector::Append:
+    // Poziom 1: Szukanie przekazania kodu glifu GLYPH_CODE_TASKBAR_SETTINGS (0xE115)
+    let mut fn_create_item_addr: Option<usize> = None;
+    let mut fn_append_addr: Option<usize> = None;
+
+    let glyph_needle = [0x15, 0xE1, 0x00, 0x00];
+    if let Some(glyph_pos) = find_subslice(fwd_slice, &glyph_needle) {
+        // Znajdź pierwsze wywołanie call po glifie (CreateMenuFlyoutItem)
+        for pos in glyph_pos..fwd_slice.len().saturating_sub(5) {
+            if fwd_slice[pos] == 0xE8 {
+                let disp = i32::from_le_bytes([
+                    fwd_slice[pos + 1],
+                    fwd_slice[pos + 2],
+                    fwd_slice[pos + 3],
+                    fwd_slice[pos + 4],
+                ]);
+                let rip = fwd_start + pos + 5;
+                let target = (rip as isize + disp as isize) as usize;
+                if target >= text_start && target < text_start + text_len {
+                    fn_create_item_addr = Some(target);
+                    // Następne wywołanie call to Append
+                    for next_pos in (pos + 5)..fwd_slice.len().saturating_sub(5) {
+                        if fwd_slice[next_pos] == 0xE8 {
+                            let next_disp = i32::from_le_bytes([
+                                fwd_slice[next_pos + 1],
+                                fwd_slice[next_pos + 2],
+                                fwd_slice[next_pos + 3],
+                                fwd_slice[next_pos + 4],
+                            ]);
+                            let next_rip = fwd_start + next_pos + 5;
+                            let next_target = (next_rip as isize + next_disp as isize) as usize;
+                            if next_target >= text_start && next_target < text_start + text_len {
+                                fn_append_addr = Some(next_target);
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
     }
 
-    let fn_create_item_addr = call_targets[1];
-    let fn_append_addr = call_targets[2];
+    // Poziom 2 (Fallback): Jeśli glif nie został bezpośrednio znaleziony, użyj indeksów wywołań
+    if fn_create_item_addr.is_none() || fn_append_addr.is_none() {
+        if call_targets.len() >= 3 {
+            fn_create_item_addr = Some(call_targets[1]);
+            fn_append_addr = Some(call_targets[2]);
+        } else if call_targets.len() == 2 {
+            fn_create_item_addr = Some(call_targets[0]);
+            fn_append_addr = Some(call_targets[1]);
+        }
+    }
+
+    let fn_create_item_addr = match fn_create_item_addr {
+        Some(a) => a,
+        None => {
+            crate::daemon_log::log_line(format!(
+                "[ctx_menu] BŁĄD: Nie znaleziono adresu CreateMenuFlyoutItem (call_targets: {})",
+                call_targets.len()
+            ));
+            return None;
+        }
+    };
+
+    let fn_append_addr = match fn_append_addr {
+        Some(a) => a,
+        None => {
+            crate::daemon_log::log_line(format!(
+                "[ctx_menu] BŁĄD: Nie znaleziono adresu Append (call_targets: {})",
+                call_targets.len()
+            ));
+            return None;
+        }
+    };
+
+    crate::daemon_log::log_line(format!(
+        "[ctx_menu] CreateMenuFlyoutItem: 0x{:X}, IVector::Append: 0x{:X}",
+        fn_create_item_addr, fn_append_addr
+    ));
 
     patch_vertical_search_icon_layout(text_start, text_len);
 
     restore_original_prologue_from_disk(hmod, base, text_va, text_raw_ptr, fn_create_item_addr);
-
     restore_original_prologue_from_disk(hmod, base, text_va, text_raw_ptr, fn_append_addr);
     restore_original_prologue_from_disk(hmod, base, text_va, text_raw_ptr, fn_settings_invoke_addr);
 
-    let detour_create_item = RawDetour::new(
-
+    let detour_create_item = match RawDetour::new(
         fn_create_item_addr as *const (),
         hooked_create_menu_flyout_item as *const (),
-    )
-    .ok()?;
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::daemon_log::log_line(format!("[ctx_menu] BŁĄD: RawDetour dla CreateMenuFlyoutItem: {}", e));
+            return None;
+        }
+    };
 
-    let detour_append = RawDetour::new(
+    let detour_append = match RawDetour::new(
         fn_append_addr as *const (),
         hooked_ivector_append as *const (),
-    )
-    .ok()?;
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::daemon_log::log_line(format!("[ctx_menu] BŁĄD: RawDetour dla Append: {}", e));
+            return None;
+        }
+    };
 
-    let detour_invoke = RawDetour::new(
+    let detour_invoke = match RawDetour::new(
         fn_settings_invoke_addr as *const (),
         hooked_settings_invoke as *const (),
-    )
-    .ok()?;
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::daemon_log::log_line(format!("[ctx_menu] BŁĄD: RawDetour dla settings_invoke: {}", e));
+            return None;
+        }
+    };
+
+    crate::daemon_log::log_line("[ctx_menu] SUKCES: Pomyślnie utworzono wszystkie detoury menu kontekstowego!");
 
     Some(ContextMenuHooks {
         fn_operator_new: std::mem::transmute(fn_operator_new_addr),
@@ -558,6 +705,8 @@ unsafe fn scan_taskbar_view_and_install() -> Option<ContextMenuHooks> {
 
 unsafe fn patch_vertical_search_icon_layout(text_start: usize, text_len: usize) {
     let slice = std::slice::from_raw_parts(text_start as *const u8, text_len);
+    let mut patched_widths = false;
+    let mut patched_metrics = false;
 
     // 1. ExperienceToggleButton::UpdateColumnWidths:
     // Wzorzec: 8B 8B 34 01 00 00 E8 ?? ?? ?? ?? 84 C0 0F 85 ?? ?? 00 00 83 BB 38 01 00 00 00 0F 84 ?? ?? 00 00
@@ -605,6 +754,8 @@ unsafe fn patch_vertical_search_icon_layout(text_start: usize, text_len: usize) 
                 let patch: [u8; 6] = [0xE9, jmp_disp[0], jmp_disp[1], jmp_disp[2], jmp_disp[3], 0x90];
                 std::ptr::copy_nonoverlapping(patch.as_ptr(), je_addr as *mut u8, 6);
                 let _ = VirtualProtect(je_addr as *const c_void, 6, old_prot, &mut old_prot);
+                patched_widths = true;
+                break;
             }
         }
     }
@@ -642,14 +793,28 @@ unsafe fn patch_vertical_search_icon_layout(text_start: usize, text_len: usize) 
             {
                 *(je_addr as *mut u8) = 0xEB;
                 let _ = VirtualProtect(je_addr as *const c_void, 2, old_prot, &mut old_prot);
+                patched_metrics = true;
+                break;
             }
         }
     }
+
+    crate::daemon_log::log_line(format!(
+        "[ctx_menu] Patch ikony wyszukiwarki: UpdateColumnWidths={}, UpdateButtonMetrics={}",
+        if patched_widths { "TAK" } else { "POMINIĘTO (inna wersja)" },
+        if patched_metrics { "TAK" } else { "POMINIĘTO (inna wersja)" }
+    ));
 }
 
-pub fn init_context_menu_hooks() {
-    if CTX_MENU_HOOKS.get().is_some() {
-        return;
+static RETRY_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+
+pub fn is_context_menu_hooked() -> bool {
+    CTX_MENU_HOOKS.get().is_some()
+}
+
+pub fn try_init_context_menu_hooks() -> bool {
+    if is_context_menu_hooked() {
+        return true;
     }
     unsafe {
         if let Some(hooks) = scan_taskbar_view_and_install() {
@@ -658,9 +823,45 @@ pub fn init_context_menu_hooks() {
                 let _ = h.detour_create_item.enable();
                 let _ = h.detour_append.enable();
                 let _ = h.detour_invoke.enable();
+                crate::daemon_log::log_line("[ctx_menu] Hooki menu kontekstowego zostały aktywowane pomyślnie!");
+                return true;
             }
         }
     }
+    false
+}
+
+pub fn start_context_menu_retry_worker() {
+    if is_context_menu_hooked() {
+        return;
+    }
+    if RETRY_WORKER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        crate::daemon_log::log_line("[ctx_menu] Rozpoczęcie asynchronicznego wątku oczekiwania na Taskbar.View.dll...");
+        for attempt in 1..=60 {
+            if is_context_menu_hooked() {
+                return;
+            }
+            if try_init_context_menu_hooks() {
+                crate::daemon_log::log_line(format!(
+                    "[ctx_menu] Hooki menu kontekstowego zostały aktywowane pomyślnie w próbie {}!",
+                    attempt
+                ));
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+        }
+        crate::daemon_log::log_line("[ctx_menu] OSTRZEŻENIE: Nie udało się zainstalować hooków menu kontekstowego po 60 sekundach.");
+    });
+}
+
+pub fn init_context_menu_hooks() {
+    if try_init_context_menu_hooks() {
+        return;
+    }
+    start_context_menu_retry_worker();
 }
 
 

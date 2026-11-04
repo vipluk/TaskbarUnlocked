@@ -100,11 +100,11 @@ pub struct Cli {
 
 
     /// Indeks monitora docelowego (sprawdź dostępne indeksy za pomocą --list)
-    #[arg(short, long, default_value_t = 1)]
+    #[arg(short, long, default_value_t = 0)]
     pub monitor: usize,
 
     /// Krawędź dokowania paska zadań na monitorze docelowym (left, right, top, bottom)
-    #[arg(short, long, value_enum, default_value_t = EdgeArg::Right)]
+    #[arg(short, long, value_enum, default_value_t = EdgeArg::Bottom)]
     pub edge: EdgeArg,
 
     /// Opcjonalna szerokość (dla left/right) lub wysokość (dla top/bottom) paska w pikselach

@@ -370,7 +370,7 @@ pub fn wait_for_shell_ready(target_index: usize, timeout: std::time::Duration) -
             && unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(tray).as_bool() };
 
         let monitors_ready = match enumerate_monitors() {
-            Ok(mons) => mons.len() > target_index,
+            Ok(mons) => !mons.is_empty(),
             Err(_) => false,
         };
 
