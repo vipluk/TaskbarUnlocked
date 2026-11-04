@@ -42,3 +42,4 @@ pub fn log_line(msg: impl AsRef<str>) {
         let _ = file.write_all(text.as_bytes());
     }
 }
+

@@ -305,6 +305,11 @@ pub fn spawn_background_daemon(exe_path: &PathBuf) -> Result<()> {
 }
 
 pub fn perform_install() -> Result<()> {
+    let fresh_install = !is_installed();
+    if fresh_install {
+        let _ = crate::storage::capture_native_baseline();
+    }
+
     disable_legacy_v2_shm();
     kill_other_instances();
     std::thread::sleep(std::time::Duration::from_millis(150));
@@ -455,14 +460,18 @@ pub fn perform_uninstall() -> Result<()> {
             let target = get_target_monitor(&monitors, settings.monitor_index)
                 .unwrap_or_else(|_| primary.clone());
 
-            // 1. Zapisz w rejestrze Windows fabryczny dół monitora głównego
-            let _ = crate::storage::restore_windows_baseline();
+            let disk_storage = crate::storage::load_or_init_storage();
+            let native_edge = crate::storage::native_edge(&disk_storage.baseline, &primary.monitor_rect);
+            let native_thickness = crate::storage::native_thickness(&disk_storage.baseline, &primary.monitor_rect);
+
+            // 1. Zapisz w rejestrze Windows wierny stan sprzed instalacji
+            let _ = crate::storage::restore_windows_baseline(&primary.monitor_rect);
 
             // 2. Wyłącz pamięć współdzieloną
             let cfg = TaskbarTargetConfig {
                 target_monitor_index: primary.index,
-                edge: DockEdge::Bottom,
-                size_override: None,
+                edge: native_edge,
+                size_override: Some(native_thickness),
                 hide_secondary_tray: false,
             };
             if let Ok(tb_state) = TaskbarState::locate(&target, cfg.edge, None) {
@@ -473,7 +482,7 @@ pub fn perform_uninstall() -> Result<()> {
                     disabled.context_menu_enabled = 0;
                     shm.write(&disabled);
                 }
-                let _ = tb_state.restore_default(&primary, &target);
+                let _ = tb_state.restore_default(&primary, &target, native_edge, native_thickness);
             }
         }
     }

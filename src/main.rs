@@ -231,7 +231,9 @@ fn main() -> Result<()> {
     };
 
     if cli.restore_baseline {
-        crate::storage::restore_windows_baseline()?;
+        let monitors = enumerate_monitors()?;
+        let primary = crate::monitor::get_primary_monitor(&monitors)?;
+        crate::storage::restore_windows_baseline(&primary.monitor_rect)?;
         println!("Przywrócono fabryczny stan rejestru Windows (Searchbox, TaskbarLocation, StuckRects3) z kopii w Dokumentach.");
         return Ok(());
     }
@@ -246,8 +248,11 @@ fn main() -> Result<()> {
             let disabled = build_shared_config(false, &config, &primary, &target, &state);
             shm.write(&disabled);
         }
-        state.restore_default(&primary, &target)?;
-        println!("Przywrócono pasek zadań oraz WorkArea na monitor główny.");
+        let disk_storage = crate::storage::load_or_init_storage();
+        let native_edge = crate::storage::native_edge(&disk_storage.baseline, &primary.monitor_rect);
+        let native_thickness = crate::storage::native_thickness(&disk_storage.baseline, &primary.monitor_rect);
+        state.restore_default(&primary, &target, native_edge, native_thickness)?;
+        println!("Przywrócono pasek zadań oraz WorkArea na monitor główny (krawędź: {:?}).", native_edge);
         return Ok(());
     }
 

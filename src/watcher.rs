@@ -750,9 +750,12 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
                     let _ = DestroyWindow(ctx.message_hwnd);
                 }
             }
+            let disk_storage = crate::storage::load_or_init_storage();
+            let native_edge = crate::storage::native_edge(&disk_storage.baseline, &ctx.primary_monitor.monitor_rect);
+            let native_thickness = crate::storage::native_thickness(&disk_storage.baseline, &ctx.primary_monitor.monitor_rect);
             let _ = ctx
                 .state
-                .restore_default(&ctx.primary_monitor, &ctx.target_monitor);
+                .restore_default(&ctx.primary_monitor, &ctx.target_monitor, native_edge, native_thickness);
         }
     }
 

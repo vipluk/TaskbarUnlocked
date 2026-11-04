@@ -339,7 +339,7 @@ fn restore_to_primary(selected_monitor: usize, _selected_edge: DockEdge, lang: G
 
     TaskbarState::update_registry_taskbar_location(DockEdge::Bottom);
     TaskbarState::adapt_searchbox_for_edge(DockEdge::Bottom);
-    tb_state.restore_default(&primary, &prev_target)?;
+    tb_state.restore_default(&primary, &prev_target, DockEdge::Bottom, 48)?;
 
 
     if let Ok(mut guard) = GUI_STATE.lock() {

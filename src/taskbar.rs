@@ -275,6 +275,16 @@ impl TaskbarState {
         }
     }
 
+    pub fn abe_to_edge(abe: u32) -> DockEdge {
+        match abe {
+            0 => DockEdge::Left,
+            1 => DockEdge::Top,
+            2 => DockEdge::Right,
+            3 => DockEdge::Bottom,
+            _ => DockEdge::Bottom,
+        }
+    }
+
     pub fn update_registry_taskbar_location(edge: DockEdge) {
         use windows::Win32::System::Registry::{
             RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
@@ -577,8 +587,11 @@ impl TaskbarState {
 
     #[allow(dead_code)]
     pub fn restore_saved_searchbox_mode() {
-
-        let _ = crate::storage::restore_windows_baseline();
+        if let Ok(monitors) = crate::monitor::enumerate_monitors() {
+            if let Ok(primary) = crate::monitor::get_primary_monitor(&monitors) {
+                let _ = crate::storage::restore_windows_baseline(&primary.monitor_rect);
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -846,6 +859,8 @@ impl TaskbarState {
         &self,
         primary_monitor: &MonitorDescriptor,
         target_monitor: &MonitorDescriptor,
+        native_edge: DockEdge,
+        native_thickness: i32,
     ) -> Result<()> {
         for &hwnd in &self.hidden_secondary_trays {
             if unsafe { IsWindow(hwnd).as_bool() } {
@@ -855,15 +870,14 @@ impl TaskbarState {
             }
         }
 
-        // Przywróć fabryczny, poziomy pasek zadań na dole monitora głównego (domyślny Windows 11)
         let pm = primary_monitor.monitor_rect;
-        let thickness = 48i32;
-        let restore_rect = RECT {
-            left: pm.left,
-            top: pm.bottom - thickness,
-            right: pm.right,
-            bottom: pm.bottom,
-        };
+        let thickness = if native_thickness > 0 { native_thickness } else { 48 };
+        let restore_rect = Self::compute_desired_rect(
+            &self.desired_rect,
+            primary_monitor,
+            native_edge,
+            Some(thickness),
+        );
 
         if self.is_valid() {
             let w = restore_rect.right - restore_rect.left;
@@ -884,7 +898,20 @@ impl TaskbarState {
 
         let mut target_full = target_monitor.monitor_rect;
         let mut primary_restored_work = pm;
-        primary_restored_work.bottom = pm.bottom - thickness;
+        match native_edge {
+            DockEdge::Left => {
+                primary_restored_work.left = pm.left + thickness;
+            }
+            DockEdge::Top => {
+                primary_restored_work.top = pm.top + thickness;
+            }
+            DockEdge::Right => {
+                primary_restored_work.right = pm.right - thickness;
+            }
+            DockEdge::Bottom => {
+                primary_restored_work.bottom = pm.bottom - thickness;
+            }
+        }
 
         unsafe {
             let _ = SystemParametersInfoW(

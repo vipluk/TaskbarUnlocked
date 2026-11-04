@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use windows::core::w;
+use windows::Win32::Foundation::RECT;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     KEY_READ, KEY_SET_VALUE, REG_BINARY, REG_DWORD,
@@ -9,6 +10,8 @@ use windows::Win32::System::Registry::{
 
 use crate::monitor::DockEdge;
 use crate::taskbar::TaskbarState;
+
+pub const BASELINE_VERSION: u32 = 2;
 
 fn default_one() -> u32 {
     1
@@ -22,6 +25,8 @@ pub struct AppDiskStorage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowsBaseline {
+    #[serde(default)]
+    pub version: u32,
     pub searchbox_mode: u32,
     pub searchbox_mode_cache: u32,
     #[serde(default = "default_one")]
@@ -31,6 +36,8 @@ pub struct WindowsBaseline {
     #[serde(default)]
     pub chat_mode: u32,
     pub taskbar_location: u32,
+    #[serde(default)]
+    pub taskbar_alignment: Option<u32>,
     pub stuck_rects3_binary: Vec<u8>,
     pub created_at: String,
 }
@@ -138,6 +145,7 @@ pub fn read_current_windows_registry_baseline() -> WindowsBaseline {
     let mut task_view_mode = 1u32;
     let mut chat_mode = 0u32;
     let mut taskbar_location = 3u32;
+    let mut taskbar_alignment = None;
     let mut stuck_rects3 = Vec::new();
 
     unsafe {
@@ -223,6 +231,9 @@ pub fn read_current_windows_registry_baseline() -> WindowsBaseline {
             if let Some(mn) = read_adv_dword(w!("TaskbarMn")) {
                 chat_mode = mn;
             }
+            if let Some(al) = read_adv_dword(w!("TaskbarAl")) {
+                taskbar_alignment = Some(al);
+            }
             let _ = RegCloseKey(adv_key);
         }
 
@@ -263,12 +274,14 @@ pub fn read_current_windows_registry_baseline() -> WindowsBaseline {
     }
 
     WindowsBaseline {
+        version: BASELINE_VERSION,
         searchbox_mode: search_mode,
         searchbox_mode_cache: search_mode_cache,
         widgets_mode,
         task_view_mode,
         chat_mode,
-        taskbar_location: 3,
+        taskbar_location,
+        taskbar_alignment,
         stuck_rects3_binary: stuck_rects3,
         created_at: current_timestamp(),
     }
@@ -278,21 +291,7 @@ pub fn load_or_init_storage() -> AppDiskStorage {
     let p = get_storage_path();
     if p.exists() {
         if let Ok(data) = std::fs::read_to_string(&p) {
-            if let Ok(mut parsed) = serde_json::from_str::<AppDiskStorage>(&data) {
-                let mut repaired = false;
-                if let Some(saved_h) = read_legacy_saved_horizontal_search_mode() {
-                    if parsed.preferences.horizontal_search_mode == 1
-                    {
-                        parsed.baseline.searchbox_mode = saved_h;
-                        parsed.baseline.searchbox_mode_cache = saved_h;
-                        parsed.baseline.taskbar_location = 3;
-                        parsed.preferences.horizontal_search_mode = saved_h;
-                        repaired = true;
-                    }
-                }
-                if repaired {
-                    let _ = save_storage(&parsed);
-                }
+            if let Ok(parsed) = serde_json::from_str::<AppDiskStorage>(&data) {
                 return parsed;
             }
         }
@@ -324,15 +323,150 @@ pub fn save_storage(storage: &AppDiskStorage) -> Result<()> {
     Ok(())
 }
 
-pub fn restore_windows_baseline() -> Result<()> {
+pub fn capture_native_baseline() -> Result<()> {
+    let mut storage = load_or_init_storage();
+    storage.baseline = read_current_windows_registry_baseline();
+    save_storage(&storage)?;
+    crate::daemon_log::log_line(format!(
+        "Pomyślnie zrzucono wierną migawkę natywnego Windows (v{}, taskbar_location={}, stuck_bytes={})",
+        storage.baseline.version,
+        storage.baseline.taskbar_location,
+        storage.baseline.stuck_rects3_binary.len()
+    ));
+    Ok(())
+}
+
+pub fn is_baseline_trustworthy(b: &WindowsBaseline, primary_rect: &RECT) -> bool {
+    if b.version < BASELINE_VERSION || b.stuck_rects3_binary.len() < 40 {
+        return false;
+    }
+
+    let abe = u32::from_le_bytes([
+        b.stuck_rects3_binary[12],
+        b.stuck_rects3_binary[13],
+        b.stuck_rects3_binary[14],
+        b.stuck_rects3_binary[15],
+    ]);
+    if abe > 3 {
+        return false;
+    }
+
+    let left = i32::from_le_bytes([
+        b.stuck_rects3_binary[24],
+        b.stuck_rects3_binary[25],
+        b.stuck_rects3_binary[26],
+        b.stuck_rects3_binary[27],
+    ]);
+    let top = i32::from_le_bytes([
+        b.stuck_rects3_binary[28],
+        b.stuck_rects3_binary[29],
+        b.stuck_rects3_binary[30],
+        b.stuck_rects3_binary[31],
+    ]);
+    let right = i32::from_le_bytes([
+        b.stuck_rects3_binary[32],
+        b.stuck_rects3_binary[33],
+        b.stuck_rects3_binary[34],
+        b.stuck_rects3_binary[35],
+    ]);
+    let bottom = i32::from_le_bytes([
+        b.stuck_rects3_binary[36],
+        b.stuck_rects3_binary[37],
+        b.stuck_rects3_binary[38],
+        b.stuck_rects3_binary[39],
+    ]);
+
+    if right <= left || bottom <= top {
+        return false;
+    }
+
+    // Sprawdź czy współrzędne paska przecinają się z monitorem głównym (czy nie były z innego monitora)
+    let intersects = left < primary_rect.right
+        && right > primary_rect.left
+        && top < primary_rect.bottom
+        && bottom > primary_rect.top;
+
+    intersects
+}
+
+pub fn native_edge(b: &WindowsBaseline, primary_rect: &RECT) -> DockEdge {
+    if is_baseline_trustworthy(b, primary_rect) {
+        let abe = u32::from_le_bytes([
+            b.stuck_rects3_binary[12],
+            b.stuck_rects3_binary[13],
+            b.stuck_rects3_binary[14],
+            b.stuck_rects3_binary[15],
+        ]);
+        match abe {
+            0 => DockEdge::Left,
+            1 => DockEdge::Top,
+            2 => DockEdge::Right,
+            3 => DockEdge::Bottom,
+            _ => TaskbarState::abe_to_edge(b.taskbar_location),
+        }
+    } else {
+        DockEdge::Bottom
+    }
+}
+
+pub fn native_thickness(b: &WindowsBaseline, primary_rect: &RECT) -> i32 {
+    if is_baseline_trustworthy(b, primary_rect) {
+        let left = i32::from_le_bytes([
+            b.stuck_rects3_binary[24],
+            b.stuck_rects3_binary[25],
+            b.stuck_rects3_binary[26],
+            b.stuck_rects3_binary[27],
+        ]);
+        let top = i32::from_le_bytes([
+            b.stuck_rects3_binary[28],
+            b.stuck_rects3_binary[29],
+            b.stuck_rects3_binary[30],
+            b.stuck_rects3_binary[31],
+        ]);
+        let right = i32::from_le_bytes([
+            b.stuck_rects3_binary[32],
+            b.stuck_rects3_binary[33],
+            b.stuck_rects3_binary[34],
+            b.stuck_rects3_binary[35],
+        ]);
+        let bottom = i32::from_le_bytes([
+            b.stuck_rects3_binary[36],
+            b.stuck_rects3_binary[37],
+            b.stuck_rects3_binary[38],
+            b.stuck_rects3_binary[39],
+        ]);
+        let w = right - left;
+        let h = bottom - top;
+        let t = w.min(h);
+        if t > 0 && t <= 250 {
+            return t;
+        }
+    }
+    48
+}
+
+pub fn restore_windows_baseline(primary_rect: &RECT) -> Result<()> {
     let storage = load_or_init_storage();
     let b = &storage.baseline;
     let p = &storage.preferences;
+
+    let trustworthy = is_baseline_trustworthy(b, primary_rect);
+    if !trustworthy {
+        crate::daemon_log::log_line(
+            "[baseline] Migawka nie jest oznaczona jako wierna v2 - przywracanie dołu monitora głównego",
+        );
+    }
 
     let restore_search = if p.horizontal_search_mode > 1 {
         p.horizontal_search_mode
     } else {
         b.searchbox_mode
+    };
+
+    let target_loc = if trustworthy {
+        b.taskbar_location
+    } else {
+        3u32
     };
 
     unsafe {
@@ -373,13 +507,12 @@ pub fn restore_windows_baseline() -> Result<()> {
         )
         .is_ok()
         {
-            let bottom_loc = 3u32;
             let _ = RegSetValueExW(
                 adv_key,
                 w!("TaskbarLocation"),
                 0,
                 REG_DWORD,
-                Some(&bottom_loc.to_le_bytes()),
+                Some(&target_loc.to_le_bytes()),
             );
             let _ = RegSetValueExW(
                 adv_key,
@@ -395,6 +528,15 @@ pub fn restore_windows_baseline() -> Result<()> {
                 REG_DWORD,
                 Some(&p.horizontal_task_view_mode.to_le_bytes()),
             );
+            if let Some(al) = b.taskbar_alignment {
+                let _ = RegSetValueExW(
+                    adv_key,
+                    w!("TaskbarAl"),
+                    0,
+                    REG_DWORD,
+                    Some(&al.to_le_bytes()),
+                );
+            }
             let _ = RegCloseKey(adv_key);
         }
 
@@ -409,9 +551,15 @@ pub fn restore_windows_baseline() -> Result<()> {
             )
             .is_ok()
             {
-                let mut buf = b.stuck_rects3_binary.clone();
-                let bottom_abe = 3u32;
-                buf[12..16].copy_from_slice(&bottom_abe.to_le_bytes());
+                let buf = if trustworthy {
+                    b.stuck_rects3_binary.clone()
+                } else {
+                    let mut b_copy = b.stuck_rects3_binary.clone();
+                    let bottom_abe = 3u32;
+                    b_copy[12..16].copy_from_slice(&bottom_abe.to_le_bytes());
+                    b_copy
+                };
+
                 let _ = RegSetValueExW(
                     stuck_key,
                     w!("Settings"),
