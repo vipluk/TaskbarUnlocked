@@ -6,11 +6,13 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, FindWindowW, GetSystemMetrics, GetWindowRect,
-    GetWindowThreadProcessId, IsWindow, IsWindowVisible, IsZoomed, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, HWND_TOP, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME,
-    SPIF_UPDATEINIFILE, SPI_SETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSENDCHANGING,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, IsZoomed, SendNotifyMessageW,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, HWND_BROADCAST, HWND_TOP, SM_CXPADDEDBORDER,
+    SM_CXSIZEFRAME, SM_CYSIZEFRAME, SPIF_UPDATEINIFILE, SPI_SETWORKAREA, SWP_ASYNCWINDOWPOS,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+    SW_SHOWNA, WM_SETTINGCHANGE,
 };
+
 
 
 use crate::monitor::{DockEdge, MonitorDescriptor};
@@ -74,11 +76,12 @@ unsafe extern "system" fn adjust_maximized_enum_proc(hwnd: HWND, lparam: LPARAM)
             expected.top,
             expected.right - expected.left,
             expected.bottom - expected.top,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS,
         );
     }
     BOOL(1)
 }
+
 
 pub fn adjust_maximized_windows_for_monitor(monitor: HMONITOR, work_rect: &RECT) {
     let ctx = MaxWinAdjustCtx {
@@ -95,7 +98,7 @@ pub fn adjust_maximized_windows_for_monitor(monitor: HMONITOR, work_rect: &RECT)
 
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct TaskbarTargetConfig {
     pub target_monitor_index: usize,
     pub edge: DockEdge,
@@ -351,20 +354,13 @@ impl TaskbarState {
     }
 
     pub fn broadcast_tray_settings() {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
-        };
         use windows::Win32::Foundation::WPARAM;
         unsafe {
-            let mut dw_res = 0usize;
-            let _ = SendMessageTimeoutW(
+            let _ = SendNotifyMessageW(
                 HWND_BROADCAST,
                 WM_SETTINGCHANGE,
                 WPARAM(0),
                 LPARAM(w!("TraySettings").as_ptr() as isize),
-                SMTO_ABORTIFHUNG,
-                300,
-                Some(&mut dw_res),
             );
         }
     }
@@ -377,6 +373,8 @@ impl TaskbarState {
 
         let is_vertical = matches!(edge, DockEdge::Left | DockEdge::Right);
         let mut storage = crate::storage::load_or_init_storage();
+        let mut reg_changed = false;
+        let mut storage_changed = false;
 
         unsafe {
             let mut search_key = HKEY::default();
@@ -401,21 +399,28 @@ impl TaskbarState {
                 );
 
                 if is_vertical {
-                    // W pionie: jeśli w rejestrze Windows był tryb 2 (pole) lub 3 (etykieta),
-                    // zachowujemy go w trwałej pamięci dla układu poziomego
-                    if q_res.is_ok() && (current_mode == 2 || current_mode == 3) {
-                        storage.preferences.horizontal_search_mode = current_mode;
-                        let _ = crate::storage::save_storage(&storage);
+                    // W pionie nadpisujemy horizontal_search_mode tylko wtedy, gdy w rejestrze
+                    // faktycznie widnieje tryb poziomy (2 = etykieta, 3 = pole) lub 0 (ukryty).
+                    // Nigdy nie nadpisujemy trybu 2/3 wartością 1 (wymuszoną przez sam pion)!
+                    if q_res.is_ok() {
+                        if current_mode == 2 || current_mode == 3 {
+                            if storage.preferences.horizontal_search_mode != current_mode {
+                                storage.preferences.horizontal_search_mode = current_mode;
+                                storage_changed = true;
+                            }
+                        } else if current_mode == 0 && !storage.preferences.last_applied_vertical {
+                            storage.preferences.horizontal_search_mode = 0;
+                            storage_changed = true;
+                        }
                     }
 
-                    // W pionie dopuszczalny jest WYŁĄCZNIE tryb 1 (Tylko ikona) lub 0 (Ukryj).
-                    // Jeśli użytkownik ma ustawione 0 (Ukryj) -> w pionie również Ukryj.
-                    // Jeśli miał 1, 2 lub 3 -> w pionie ustawiamy 1 (Tylko ikona).
+
                     let target_vertical_mode = if storage.preferences.horizontal_search_mode == 0 {
                         0u32
                     } else {
                         1u32
                     };
+                    storage.preferences.vertical_search_mode = target_vertical_mode;
 
                     if !q_res.is_ok() || current_mode != target_vertical_mode {
                         let _ = RegSetValueExW(
@@ -432,11 +437,27 @@ impl TaskbarState {
                             REG_DWORD,
                             Some(&target_vertical_mode.to_le_bytes()),
                         );
-                        Self::broadcast_tray_settings();
-                        Self::restart_search_host();
+                        reg_changed = true;
                     }
                 } else {
-                    // W poziomie: przywracamy preferowany tryb użytkownika z pamięci (0, 1, 2 lub 3)
+                    if q_res.is_ok() {
+                        if storage.preferences.last_applied_vertical {
+                            if current_mode == 0 && storage.preferences.vertical_search_mode != 0 {
+                                storage.preferences.horizontal_search_mode = 0;
+                                storage_changed = true;
+                            } else if current_mode >= 2 {
+                                storage.preferences.horizontal_search_mode = current_mode;
+                                storage_changed = true;
+                            } else if current_mode == 1 && storage.preferences.horizontal_search_mode == 0 {
+                                storage.preferences.horizontal_search_mode = 1;
+                                storage_changed = true;
+                            }
+                        } else if storage.preferences.horizontal_search_mode != current_mode {
+                            storage.preferences.horizontal_search_mode = current_mode;
+                            storage_changed = true;
+                        }
+                    }
+
                     let target_horizontal_mode = storage.preferences.horizontal_search_mode;
                     if !q_res.is_ok() || current_mode != target_horizontal_mode {
                         let _ = RegSetValueExW(
@@ -453,22 +474,116 @@ impl TaskbarState {
                             REG_DWORD,
                             Some(&target_horizontal_mode.to_le_bytes()),
                         );
-                        Self::broadcast_tray_settings();
-                        Self::restart_search_host();
+                        reg_changed = true;
                     }
                 }
 
                 let _ = RegCloseKey(search_key);
             }
         }
+        Self::adapt_widgets_for_edge(is_vertical, &mut storage, &mut reg_changed, &mut storage_changed);
+    }
+
+
+    fn adapt_widgets_for_edge(
+        is_vertical: bool,
+        storage: &mut crate::storage::AppDiskStorage,
+        reg_changed: &mut bool,
+        storage_changed: &mut bool,
+    ) {
+        use windows::Win32::System::Registry::{
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+            KEY_READ, KEY_SET_VALUE, REG_DWORD,
+        };
+
+        unsafe {
+            let mut adv_key = HKEY::default();
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"),
+                0,
+                KEY_READ | KEY_SET_VALUE,
+                &mut adv_key,
+            )
+            .is_ok()
+            {
+                let mut cur_widgets: u32 = 1;
+                let mut len = 4u32;
+                let has_widgets = RegQueryValueExW(
+                    adv_key,
+                    w!("TaskbarDa"),
+                    None,
+                    None,
+                    Some(&mut cur_widgets as *mut u32 as *mut u8),
+                    Some(&mut len),
+                )
+                .is_ok();
+
+                if is_vertical {
+                    if has_widgets && cur_widgets != 0 {
+                        if storage.preferences.horizontal_widgets_mode != cur_widgets {
+                            storage.preferences.horizontal_widgets_mode = cur_widgets;
+                            *storage_changed = true;
+                        }
+                    }
+
+                    let target_widgets = 0u32;
+                    if !has_widgets || cur_widgets != target_widgets {
+                        let _ = RegSetValueExW(
+                            adv_key,
+                            w!("TaskbarDa"),
+                            0,
+                            REG_DWORD,
+                            Some(&target_widgets.to_le_bytes()),
+                        );
+                        *reg_changed = true;
+                    }
+                } else {
+                    if has_widgets && !storage.preferences.last_applied_vertical {
+                        if storage.preferences.horizontal_widgets_mode != cur_widgets {
+                            storage.preferences.horizontal_widgets_mode = cur_widgets;
+                            *storage_changed = true;
+                        }
+                    }
+                    let target_widgets = storage.preferences.horizontal_widgets_mode;
+                    if !has_widgets || cur_widgets != target_widgets {
+                        let _ = RegSetValueExW(
+                            adv_key,
+                            w!("TaskbarDa"),
+                            0,
+                            REG_DWORD,
+                            Some(&target_widgets.to_le_bytes()),
+                        );
+                        *reg_changed = true;
+                    }
+                }
+
+                let _ = RegCloseKey(adv_key);
+            }
+        }
+
+        if storage.preferences.last_applied_vertical != is_vertical {
+            storage.preferences.last_applied_vertical = is_vertical;
+            *storage_changed = true;
+        }
+
+        if *storage_changed {
+            let _ = crate::storage::save_storage(storage);
+        }
+        if *reg_changed {
+            Self::broadcast_tray_settings();
+        }
     }
 
     #[allow(dead_code)]
     pub fn restore_saved_searchbox_mode() {
+
         let _ = crate::storage::restore_windows_baseline();
     }
 
+    #[allow(dead_code)]
     pub fn restart_search_host() {
+
         use windows::Win32::System::Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
             TH32CS_SNAPPROCESS,
@@ -535,7 +650,7 @@ impl TaskbarState {
                         m.top,
                         w,
                         h,
-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS,
                     );
                 }
             }
@@ -559,9 +674,10 @@ impl TaskbarState {
                 self.desired_rect.top,
                 width,
                 height,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_SHOWWINDOW,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS,
             )
             .context("SetWindowPos dla Shell_TrayWnd nie powiodło się")?;
+
 
             if let Ok(bridge_hwnd) = FindWindowExW(
                 self.main_tray_hwnd,
@@ -577,7 +693,7 @@ impl TaskbarState {
                         0,
                         width,
                         height,
-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS,
                     );
                 }
             }
@@ -585,6 +701,7 @@ impl TaskbarState {
 
         Ok(())
     }
+
 
     pub fn hide_conflicting_secondary_tray(
         &mut self,

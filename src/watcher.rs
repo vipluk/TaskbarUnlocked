@@ -132,6 +132,9 @@ fn sync_ctx_from_shm(ctx: &mut GlobalWatcherContext) -> bool {
     }
     ctx.state.desired_rect = shm_cfg.desired_taskbar_rect;
     ctx.config.target_monitor_index = shm_cfg.target_monitor_index as usize;
+    ctx.target_monitor.index = shm_cfg.target_monitor_index as usize;
+    ctx.target_monitor.handle = windows::Win32::Graphics::Gdi::HMONITOR(shm_cfg.target_hmonitor as *mut std::ffi::c_void);
+    ctx.target_monitor.monitor_rect = shm_cfg.target_rect;
     ctx.config.edge = match shm_cfg.edge {
         0 => crate::monitor::DockEdge::Left,
         1 => crate::monitor::DockEdge::Top,
@@ -141,6 +144,7 @@ fn sync_ctx_from_shm(ctx: &mut GlobalWatcherContext) -> bool {
     };
     true
 }
+
 
 unsafe extern "system" fn win_event_proc(
     _h_win_event_hook: HWINEVENTHOOK,
@@ -348,6 +352,93 @@ fn rebind_taskbar(ctx: &mut GlobalWatcherContext) -> Result<()> {
     Ok(())
 }
 
+pub fn wait_for_shell_ready(target_index: usize, timeout: std::time::Duration) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut stable_hits = 0;
+
+    while start.elapsed() < timeout {
+        if STOP_REQUESTED.load(Ordering::SeqCst) {
+            return Err(anyhow!("Zażądano zatrzymania aplikacji"));
+        }
+
+        let tray = unsafe { windows::Win32::UI::WindowsAndMessaging::FindWindowW(w!("Shell_TrayWnd"), None).unwrap_or_default() };
+        let tray_visible = !tray.0.is_null()
+            && unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(tray).as_bool() };
+
+        let monitors_ready = match enumerate_monitors() {
+            Ok(mons) => mons.len() > target_index,
+            Err(_) => false,
+        };
+
+        if tray_visible && monitors_ready {
+            stable_hits += 1;
+            if stable_hits >= 2 {
+                return Ok(());
+            }
+        } else {
+            stable_hits = 0;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    Err(anyhow!(
+        "Upłynął limit czasu ({:?}) oczekiwania na powłokę Windows i monitor #{}",
+        timeout,
+        target_index
+    ))
+}
+
+pub fn run_daemon(config: TaskbarTargetConfig) -> Result<()> {
+    crate::daemon_log::log_line("Uruchamianie procesu demona --daemon...");
+
+    let Some(_guard) = crate::single_instance::InstanceGuard::acquire()? else {
+        crate::daemon_log::log_line("Instancja demona jest już aktywna w systemie. Zamykanie.");
+        return Ok(());
+    };
+
+    crate::daemon_log::log_line(format!(
+        "Pomyślnie zablokowano mutex instancji. Cel: monitor #{}, krawędź {:?}",
+        config.target_monitor_index, config.edge
+    ));
+
+    for attempt in 1..=10 {
+        if STOP_REQUESTED.load(Ordering::SeqCst) {
+            crate::daemon_log::log_line("Przerwano uruchamianie demona: STOP_REQUESTED");
+            return Ok(());
+        }
+
+        crate::daemon_log::log_line(format!("[próba {}/10] Oczekiwanie na gotowość powłoki...", attempt));
+        if let Err(e) = wait_for_shell_ready(config.target_monitor_index, std::time::Duration::from_secs(120)) {
+            crate::daemon_log::log_line(format!("[próba {}] Błąd oczekiwania na powłokę: {:#}", attempt, e));
+        }
+
+        match run_watcher_loop(config) {
+            Ok(()) => {
+                crate::daemon_log::log_line(format!("[próba {}] Pętla strażnika zakończona prawidłowo.", attempt));
+                return Ok(());
+            }
+            Err(e) => {
+                crate::daemon_log::log_line(format!(
+                    "[próba {}] run_watcher_loop zakończyło się błędem: {:#}",
+                    attempt, e
+                ));
+            }
+        }
+
+        if STOP_REQUESTED.load(Ordering::SeqCst) {
+            crate::daemon_log::log_line("STOP_REQUESTED jest ustawione po pętli. Zakończenie demona.");
+            return Ok(());
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    let err_msg = "Demon nie był w stanie utrzymać strażnika paska zadań po 10 próbach";
+    crate::daemon_log::log_line(err_msg);
+    Err(anyhow!(err_msg))
+}
+
 
 pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
     let monitors = enumerate_monitors()?;
@@ -488,7 +579,9 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
     }
 
     {
-        let mut guard = GLOBAL_CTX.lock().unwrap();
+        let mut guard = GLOBAL_CTX
+            .lock()
+            .map_err(|_| anyhow!("Blokada GLOBAL_CTX uległa zatruciu"))?;
         *guard = Some(GlobalWatcherContext {
             config,
             state,
@@ -499,138 +592,139 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
             enforcing_lock: false,
             shm,
             dll_path,
-
         });
     }
 
+    crate::daemon_log::log_line(format!(
+        "[aktywny] Strażnik pozycji paska zadań działa na monitorze #{} (krawędź {:?})",
+        config.target_monitor_index, config.edge
+    ));
     println!("[aktywny] Strażnik pozycji paska zadań + Przeciąganie (Drag & Drop) działają. Naciśnij Ctrl+C, aby zakończyć.");
 
     let mut drag_ctrl = crate::drag::TaskbarDragController::new();
     let mut msg = MSG::default();
+    let mut should_quit = false;
     loop {
         if STOP_REQUESTED.load(Ordering::SeqCst) {
             break;
         }
 
-        let has_msg = unsafe { PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE) };
-        if has_msg.as_bool() {
+        while unsafe { PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() } {
             if msg.message == windows::Win32::UI::WindowsAndMessaging::WM_QUIT {
+                should_quit = true;
                 break;
             }
             unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-        } else {
-            let mut tray_info: Option<(HWND, bool)> = None;
-            if let Ok(guard) = GLOBAL_CTX.lock() {
-                if let Some(ctx) = guard.as_ref() {
-                    let is_locked = ctx
-                        .shm
-                        .read()
-                        .map(|c| c.locked != 0)
-                        .unwrap_or(false);
-                    tray_info = Some((ctx.state.main_tray_hwnd, is_locked));
-                }
+        }
+        if should_quit || STOP_REQUESTED.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let mut tray_info: Option<(HWND, bool)> = None;
+        if let Ok(guard) = GLOBAL_CTX.lock() {
+            if let Some(ctx) = guard.as_ref() {
+                let is_locked = ctx
+                    .shm
+                    .read()
+                    .map(|c| c.locked != 0)
+                    .unwrap_or(false);
+                tray_info = Some((ctx.state.main_tray_hwnd, is_locked));
             }
+        }
 
-            if let Some((tray_hwnd, is_locked)) = tray_info {
-                if let Some((new_mon_idx, new_edge)) = drag_ctrl.poll_step(tray_hwnd, is_locked) {
-                    let mut post_work_args = None;
-                    if let Ok(mut guard) = GLOBAL_CTX.lock() {
-                        if let Some(ctx) = guard.as_mut() {
-                            ctx.config.target_monitor_index = new_mon_idx;
-                            ctx.config.edge = new_edge;
+        if let Some((tray_hwnd, is_locked)) = tray_info {
+            if let Some((new_mon_idx, new_edge)) = drag_ctrl.poll_step(tray_hwnd, is_locked) {
+                let prev = crate::installer::load_persisted_settings();
+                crate::installer::save_persisted_settings(
+                    &crate::installer::PersistedSettings {
+                        active: true,
+                        locked: is_locked,
+                        monitor_index: new_mon_idx,
+                        edge: new_edge,
+                        lang_mode: prev.lang_mode,
+                    },
+                );
 
-                            let prev = crate::installer::load_persisted_settings();
-                            crate::installer::save_persisted_settings(
-                                &crate::installer::PersistedSettings {
-                                    active: true,
-                                    locked: is_locked,
-                                    monitor_index: new_mon_idx,
-                                    edge: new_edge,
-                                    lang_mode: prev.lang_mode,
-                                },
-                            );
+                TaskbarState::update_registry_taskbar_location(new_edge);
+                TaskbarState::adapt_searchbox_for_edge(new_edge);
 
-                            let mut disk_storage = crate::storage::load_or_init_storage();
-                            disk_storage.preferences.edge = new_edge;
-                            disk_storage.preferences.monitor_index = new_mon_idx;
-                            disk_storage.preferences.locked = is_locked;
-                            disk_storage.preferences.active = true;
-                            disk_storage.preferences.updated_at = crate::storage::current_timestamp();
-                            let _ = crate::storage::save_storage(&disk_storage);
 
-                            if let Ok(monitors) = enumerate_monitors() {
-                                if let (Ok(primary), Ok(target)) = (
-                                    get_primary_monitor(&monitors),
-                                    get_target_monitor(&monitors, new_mon_idx),
-                                ) {
-                                    let new_rect = TaskbarState::compute_desired_rect(
-                                        &ctx.state.desired_rect,
-                                        &target,
-                                        new_edge,
-                                        ctx.config.size_override,
-                                    );
-                                    ctx.primary_monitor = primary;
-                                    ctx.target_monitor = target;
-                                    ctx.state.desired_rect = new_rect;
+                let mut post_work_args = None;
+                if let Ok(monitors) = enumerate_monitors() {
+                    if let (Ok(primary), Ok(target)) = (
+                        get_primary_monitor(&monitors),
+                        get_target_monitor(&monitors, new_mon_idx),
+                    ) {
+                        if let Ok(mut guard) = GLOBAL_CTX.lock() {
+                            if let Some(ctx) = guard.as_mut() {
+                                ctx.config.target_monitor_index = new_mon_idx;
+                                ctx.config.edge = new_edge;
 
-                                    TaskbarState::update_registry_taskbar_location(new_edge);
-                                    TaskbarState::update_registry_stuck_rects3(new_edge, &new_rect);
-                                    TaskbarState::adapt_searchbox_for_edge(new_edge);
+                                let new_rect = TaskbarState::compute_desired_rect(
+                                    &ctx.state.desired_rect,
+                                    &target,
+                                    new_edge,
+                                    ctx.config.size_override,
+                                );
+                                ctx.primary_monitor = primary;
+                                ctx.target_monitor = target;
+                                ctx.state.desired_rect = new_rect;
 
-                                    let mut new_shm = build_shared_config(
-                                        true,
-                                        &ctx.config,
-                                        &ctx.primary_monitor,
-                                        &ctx.target_monitor,
-                                        &ctx.state,
-                                    );
-                                    new_shm.locked = if is_locked { 1 } else { 0 };
-                                    ctx.shm.write(&new_shm);
+                                TaskbarState::update_registry_stuck_rects3(new_edge, &new_rect);
 
-                                    if ctx.config.hide_secondary_tray {
-                                        let _ = ctx
-                                            .state
-                                            .hide_conflicting_secondary_tray(&ctx.target_monitor);
-                                    }
-                                    ctx.enforcing_lock = true;
-                                    let _ = ctx.state.enforce_position();
-                                    ctx.state.notify_tray_layout_refresh();
-                                    ctx.enforcing_lock = false;
+                                let mut new_shm = build_shared_config(
+                                    true,
+                                    &ctx.config,
+                                    &ctx.primary_monitor,
+                                    &ctx.target_monitor,
+                                    &ctx.state,
+                                );
+                                new_shm.locked = if is_locked { 1 } else { 0 };
+                                ctx.shm.write(&new_shm);
 
-                                    if !ctx.message_hwnd.0.is_null() {
-                                        unsafe {
-                                            let _ = SetTimer(
-                                                ctx.message_hwnd,
-                                                TIMER_REASSERT_WORKAREA,
-                                                90,
-                                                None,
-                                            );
-                                        }
-                                    }
-
-                                    post_work_args = Some((
-                                        ctx.primary_monitor.clone(),
-                                        ctx.target_monitor.clone(),
-                                        ctx.state.desired_rect,
-                                        new_edge,
-                                    ));
+                                if ctx.config.hide_secondary_tray {
+                                    let _ = ctx
+                                        .state
+                                        .hide_conflicting_secondary_tray(&ctx.target_monitor);
                                 }
+                                ctx.enforcing_lock = true;
+                                let _ = ctx.state.enforce_position();
+                                ctx.state.notify_tray_layout_refresh();
+                                ctx.enforcing_lock = false;
+
+                                if !ctx.message_hwnd.0.is_null() {
+                                    unsafe {
+                                        let _ = SetTimer(
+                                            ctx.message_hwnd,
+                                            TIMER_REASSERT_WORKAREA,
+                                            90,
+                                            None,
+                                        );
+                                    }
+                                }
+
+                                post_work_args = Some((
+                                    ctx.primary_monitor.clone(),
+                                    ctx.target_monitor.clone(),
+                                    ctx.state.desired_rect,
+                                    new_edge,
+                                ));
                             }
                         }
                     }
-                    if let Some((pm, tm, rc, edge)) = post_work_args {
-                        let _ = TaskbarState::update_work_areas(&pm, &tm, &rc, edge);
-                    }
+                }
+                if let Some((pm, tm, rc, edge)) = post_work_args {
+                    let _ = TaskbarState::update_work_areas(&pm, &tm, &rc, edge);
                 }
             }
-
-
-            std::thread::sleep(std::time::Duration::from_millis(8));
         }
+
+        std::thread::sleep(std::time::Duration::from_millis(8));
     }
+
     drag_ctrl.hide_overlay();
 
 

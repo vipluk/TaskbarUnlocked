@@ -280,14 +280,6 @@ fn apply_selected_settings(selected_monitor: usize, selected_edge: DockEdge, lan
     TaskbarState::update_registry_taskbar_location(selected_edge);
     TaskbarState::adapt_searchbox_for_edge(selected_edge);
 
-    let mut disk_storage = crate::storage::load_or_init_storage();
-    disk_storage.preferences.edge = selected_edge;
-    disk_storage.preferences.monitor_index = selected_monitor;
-    disk_storage.preferences.lang_mode = lang as u32;
-    disk_storage.preferences.active = true;
-    disk_storage.preferences.updated_at = crate::storage::current_timestamp();
-    let _ = crate::storage::save_storage(&disk_storage);
-
     let mut tb_state = TaskbarState::locate(&target, cfg.edge, cfg.size_override)?;
     TaskbarState::update_registry_stuck_rects3(selected_edge, &tb_state.desired_rect);
 
@@ -317,7 +309,7 @@ fn restore_to_primary(selected_monitor: usize, _selected_edge: DockEdge, lang: G
     disable_legacy_v2_shm();
     let monitors = enumerate_monitors()?;
     let primary = get_primary_monitor(&monitors)?;
-    let target = get_target_monitor(&monitors, selected_monitor)
+    let prev_target = get_target_monitor(&monitors, selected_monitor)
         .unwrap_or_else(|_| primary.clone());
 
     let prev = load_persisted_settings();
@@ -329,14 +321,6 @@ fn restore_to_primary(selected_monitor: usize, _selected_edge: DockEdge, lang: G
         lang_mode: lang as u32,
     });
 
-    let mut disk_storage = crate::storage::load_or_init_storage();
-    disk_storage.preferences.edge = DockEdge::Bottom;
-    disk_storage.preferences.monitor_index = primary.index;
-    disk_storage.preferences.lang_mode = lang as u32;
-    disk_storage.preferences.active = true;
-    disk_storage.preferences.updated_at = crate::storage::current_timestamp();
-    let _ = crate::storage::save_storage(&disk_storage);
-
     let cfg = TaskbarTargetConfig {
         target_monitor_index: primary.index,
         edge: DockEdge::Bottom,
@@ -344,9 +328,10 @@ fn restore_to_primary(selected_monitor: usize, _selected_edge: DockEdge, lang: G
         hide_secondary_tray: false,
     };
 
-    let tb_state = TaskbarState::locate(&target, cfg.edge, cfg.size_override)?;
+    let tb_state = TaskbarState::locate(&primary, cfg.edge, cfg.size_override)?;
+    TaskbarState::update_registry_stuck_rects3(DockEdge::Bottom, &tb_state.desired_rect);
     if let Ok(shm) = ShmGuard::create_or_open() {
-        let mut active_cfg = build_shared_config(true, &cfg, &primary, &target, &tb_state);
+        let mut active_cfg = build_shared_config(true, &cfg, &primary, &primary, &tb_state);
         active_cfg.lang_mode = lang as u32;
         active_cfg.context_menu_enabled = 1;
         shm.write(&active_cfg);
@@ -354,7 +339,8 @@ fn restore_to_primary(selected_monitor: usize, _selected_edge: DockEdge, lang: G
 
     TaskbarState::update_registry_taskbar_location(DockEdge::Bottom);
     TaskbarState::adapt_searchbox_for_edge(DockEdge::Bottom);
-    tb_state.restore_default(&primary, &target)?;
+    tb_state.restore_default(&primary, &prev_target)?;
+
 
     if let Ok(mut guard) = GUI_STATE.lock() {
         if let Some(st) = guard.as_mut() {

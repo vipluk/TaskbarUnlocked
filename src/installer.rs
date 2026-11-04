@@ -17,7 +17,8 @@ use windows::Win32::System::Threading::{
     PROCESS_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
+    MessageBoxW, IDNO, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND,
+    MB_YESNOCANCEL,
 };
 
 use crate::i18n::{detect_default_gui_lang, GuiLang};
@@ -32,8 +33,6 @@ const REG_APP_KEY: PCWSTR = w!("Software\\TaskbarUnlocked");
 const REG_RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const REG_RUN_VAL_NAME: PCWSTR = w!("TaskbarUnlocked");
 const EMBEDDED_HOOK_DLL: &[u8] = include_bytes!("../target/release/taskbar_unlocked_hook.dll");
-
-
 
 #[derive(Debug, Clone, Copy)]
 pub struct PersistedSettings {
@@ -50,12 +49,11 @@ impl Default for PersistedSettings {
             active: true,
             locked: false,
             monitor_index: 1,
-            edge: DockEdge::Bottom,
+            edge: DockEdge::Right,
             lang_mode: 0,
         }
     }
 }
-
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -103,7 +101,6 @@ pub fn save_persisted_settings(settings: &PersistedSettings) {
                 REG_DWORD,
                 Some(&locked_val.to_le_bytes()),
             );
-
             let _ = RegSetValueExW(
                 hkey,
                 w!("MonitorIndex"),
@@ -128,10 +125,27 @@ pub fn save_persisted_settings(settings: &PersistedSettings) {
             let _ = RegCloseKey(hkey);
         }
     }
+
+    let mut disk_storage = crate::storage::load_or_init_storage();
+    disk_storage.preferences.active = settings.active;
+    disk_storage.preferences.locked = settings.locked;
+    disk_storage.preferences.monitor_index = settings.monitor_index;
+    disk_storage.preferences.edge = settings.edge;
+    disk_storage.preferences.lang_mode = settings.lang_mode;
+    disk_storage.preferences.updated_at = crate::storage::current_timestamp();
+    let _ = crate::storage::save_storage(&disk_storage);
 }
 
 pub fn load_persisted_settings() -> PersistedSettings {
-    let mut out = PersistedSettings::default();
+    let disk_storage = crate::storage::load_or_init_storage();
+    let mut out = PersistedSettings {
+        active: disk_storage.preferences.active,
+        locked: disk_storage.preferences.locked,
+        monitor_index: disk_storage.preferences.monitor_index,
+        edge: disk_storage.preferences.edge,
+        lang_mode: disk_storage.preferences.lang_mode,
+    };
+
     unsafe {
         let mut hkey = HKEY::default();
         if RegOpenKeyExW(HKEY_CURRENT_USER, REG_APP_KEY, 0, KEY_READ, &mut hkey).is_ok() {
@@ -154,28 +168,45 @@ pub fn load_persisted_settings() -> PersistedSettings {
                 }
             };
 
-            if let Some(a) = read_dword(w!("Active")) {
-                out.active = a != 0;
-            }
-            if let Some(lck) = read_dword(w!("Locked")) {
-                out.locked = lck != 0;
-            }
-            if let Some(m) = read_dword(w!("MonitorIndex")) {
+            let reg_active = read_dword(w!("Active")).map(|a| a != 0);
+            let reg_locked = read_dword(w!("Locked")).map(|l| l != 0);
+            let reg_mon = read_dword(w!("MonitorIndex")).map(|m| m as usize);
+            let reg_edge = read_dword(w!("Edge")).map(|e| match e {
+                0 => DockEdge::Left,
+                1 => DockEdge::Top,
+                2 => DockEdge::Right,
+                3 => DockEdge::Bottom,
+                _ => DockEdge::Right,
+            });
+            let reg_lang = read_dword(w!("LangMode"));
 
-                out.monitor_index = m as usize;
+            if let Some(a) = reg_active {
+                out.active = a;
             }
-            if let Some(e) = read_dword(w!("Edge")) {
-                out.edge = match e {
-                    0 => DockEdge::Left,
-                    1 => DockEdge::Top,
-                    2 => DockEdge::Right,
-                    3 => DockEdge::Bottom,
-                    _ => DockEdge::Right,
-                };
+            if let Some(lck) = reg_locked {
+                out.locked = lck;
             }
-            if let Some(l) = read_dword(w!("LangMode")) {
+            if let Some(l) = reg_lang {
                 out.lang_mode = l;
             }
+
+            // Jeśli rejestr nie został wyzerowany przez starą deinstalację (Active=0, MonitorIndex=0, Edge=Bottom),
+            // uwzględnij wartości z rejestru; w przeciwnym razie zachowaj ostatnio używane miejsce z config.json!
+            let was_wiped_by_old_uninstall = reg_active == Some(false)
+                && reg_mon == Some(0)
+                && reg_edge == Some(DockEdge::Bottom)
+                && (disk_storage.preferences.monitor_index != 0
+                    || disk_storage.preferences.edge != DockEdge::Bottom);
+
+            if !was_wiped_by_old_uninstall {
+                if let Some(m) = reg_mon {
+                    out.monitor_index = m;
+                }
+                if let Some(e) = reg_edge {
+                    out.edge = e;
+                }
+            }
+
             let _ = RegCloseKey(hkey);
         }
     }
@@ -183,6 +214,10 @@ pub fn load_persisted_settings() -> PersistedSettings {
 }
 
 pub fn is_installed() -> bool {
+    if crate::autostart::is_logon_task_registered() {
+        return true;
+    }
+
     unsafe {
         let mut hkey = HKEY::default();
         if RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_READ, &mut hkey).is_ok() {
@@ -205,7 +240,6 @@ fn kill_other_instances() {
         Err(_) => return,
     };
 
-
     let mut pe = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
@@ -221,7 +255,8 @@ fn kill_other_instances() {
                     .unwrap_or(pe.szExeFile.len());
                 let name = String::from_utf16_lossy(&pe.szExeFile[..nul_pos]).to_ascii_lowercase();
                 if name == "taskbar-unlocked.exe" || name == "win11-taskbar-unpinner.exe" {
-                    if let Ok(hp) = unsafe { OpenProcess(PROCESS_TERMINATE, false, pe.th32ProcessID) } {
+                    if let Ok(hp) = unsafe { OpenProcess(PROCESS_TERMINATE, false, pe.th32ProcessID) }
+                    {
                         unsafe {
                             let _ = TerminateProcess(hp, 0);
                             let _ = CloseHandle(hp);
@@ -234,13 +269,12 @@ fn kill_other_instances() {
             }
         }
     }
-
     unsafe {
         let _ = CloseHandle(snap);
     }
 }
 
-fn spawn_background_daemon(exe_path: &PathBuf) -> Result<()> {
+pub fn spawn_background_daemon(exe_path: &PathBuf) -> Result<()> {
     let cmd_str = format!("\"{}\" --daemon", exe_path.display());
     let mut cmd_wide = to_wide(&cmd_str);
 
@@ -263,8 +297,7 @@ fn spawn_background_daemon(exe_path: &PathBuf) -> Result<()> {
             &si,
             &mut pi,
         )
-        .context("Nie udało się uruchomić procesu demona w tle")?;
-
+        .context("CreateProcessW nie powiodło się dla procesu demona w tle")?;
         let _ = CloseHandle(pi.hThread);
         let _ = CloseHandle(pi.hProcess);
     }
@@ -299,8 +332,6 @@ pub fn perform_install() -> Result<()> {
         let _ = std::fs::write(&target_dll, EMBEDDED_HOOK_DLL);
     }
 
-
-    let _ = crate::storage::load_or_init_storage();
     let mut initial_settings = load_persisted_settings();
     initial_settings.active = true;
     save_persisted_settings(&initial_settings);
@@ -329,21 +360,38 @@ pub fn perform_install() -> Result<()> {
 
     spawn_background_daemon(&target_exe)?;
 
+    let autostart_res = crate::autostart::register_logon_task(&target_exe)
+        .unwrap_or(crate::autostart::AutostartKind::RunKeyOnly);
+
     let lang = detect_default_gui_lang();
-    let (title, body) = match lang {
-        GuiLang::Polish => (
+    let (title, body) = match (lang, autostart_res) {
+        (GuiLang::Polish, crate::autostart::AutostartKind::ScheduledTask) => (
             "Zaawansowane ustawienia paska zadań — Zainstalowano",
-            "Aplikacja została pomyślnie zainstalowana i dodana do autostartu systemu Windows!\n\n\
-             • Twój pasek zadań jest aktywny i po każdym uruchomieniu systemu automatycznie pojawi się na wybranym miejscu.\n\
-             • Kliknij prawym przyciskiem myszy na pasek zadań i wybierz „Zaawansowane ustawienia paska zadań”, aby zmienić monitor, krawędź lub język.\n\
-             • Ponowne uruchomienie tego pliku .exe odinstaluje aplikację i przywróci system do normalności.",
+            "Aplikacja została pomyślnie zainstalowana i dodana do szybkiego autostartu systemu Windows (Harmonogram zadań)!\n\n\
+             • Twój pasek zadań pojawi się na wybranym miejscu natychmiast po zalogowaniu do systemu.\n\
+             • Kliknij prawym przyciskiem myszy na pasek zadań i wybierz „Zaawansowane ustawienia paska zadań”, aby dostosować monitor, krawędź lub język.\n\
+             • Ponowne uruchomienie tego pliku .exe pozwoli zarządzać instalacją lub ją odinstalować.",
         ),
-        GuiLang::English => (
+        (GuiLang::Polish, crate::autostart::AutostartKind::RunKeyOnly) => (
+            "Zaawansowane ustawienia paska zadań — Zainstalowano (standardowy autostart)",
+            "Aplikacja została zainstalowana w tradycyjnym autostartu (klucz Run).\n\n\
+             • Pasek zadań przeniesie się po chwili, gdy system Windows uruchomi aplikacje autostartu.\n\
+             • Kliknij prawym przyciskiem myszy na pasek zadań i wybierz „Zaawansowane ustawienia paska zadań”, aby dostosować opcje.\n\
+             • Ponowne uruchomienie tego pliku .exe pozwoli zarządzać instalacją lub ją odinstalować.",
+        ),
+        (GuiLang::English, crate::autostart::AutostartKind::ScheduledTask) => (
             "Advanced Taskbar Settings — Installed",
-            "The application has been successfully installed and added to Windows startup!\n\n\
-             • Your taskbar will automatically appear at your chosen monitor and edge on every system boot.\n\
+            "The application has been successfully installed and registered for instant startup (Task Scheduler)!\n\n\
+             • Your taskbar will automatically appear at your chosen location immediately upon user logon.\n\
              • Right-click the taskbar and select 'Advanced taskbar settings' to change monitor, edge, or language.\n\
-             • Running this .exe file again will uninstall the application and restore default Windows behavior.",
+             • Running this .exe file again allows you to manage or uninstall the application.",
+        ),
+        (GuiLang::English, crate::autostart::AutostartKind::RunKeyOnly) => (
+            "Advanced Taskbar Settings — Installed (Standard startup)",
+            "The application has been installed using standard Windows startup (Run key).\n\n\
+             • The taskbar will move after Windows processes startup applications.\n\
+             • Right-click the taskbar and select 'Advanced taskbar settings' to configure options.\n\
+             • Running this .exe file again allows you to manage or uninstall the application.",
         ),
     };
 
@@ -401,7 +449,7 @@ pub fn perform_uninstall() -> Result<()> {
     kill_other_instances();
     std::thread::sleep(std::time::Duration::from_millis(150));
 
-    let settings = load_persisted_settings();
+    let mut settings = load_persisted_settings();
     if let Ok(monitors) = enumerate_monitors() {
         if let Ok(primary) = get_primary_monitor(&monitors) {
             let target = get_target_monitor(&monitors, settings.monitor_index)
@@ -444,12 +492,13 @@ pub fn perform_uninstall() -> Result<()> {
             let _ = RegDeleteValueW(hkey, REG_RUN_VAL_NAME);
             let _ = RegCloseKey(hkey);
         }
-        let mut settings = load_persisted_settings();
-        settings.active = false;
-        settings.monitor_index = 0;
-        settings.edge = DockEdge::Bottom;
-        save_persisted_settings(&settings);
     }
+
+    crate::autostart::unregister_logon_task();
+
+    // Zachowaj ostatnio używany monitor_index oraz edge w pamięci, zmieniając tylko active = false!
+    settings.active = false;
+    save_persisted_settings(&settings);
 
     // 3. Zrestartuj proces explorer.exe, aby zwolnić hook DLL i wczytać czysty natywny pasek zadań
     restart_explorer();
@@ -490,10 +539,41 @@ pub fn perform_uninstall() -> Result<()> {
 
 pub fn toggle_install_or_uninstall() -> Result<()> {
     if is_installed() {
-        perform_uninstall()
+        let lang = detect_default_gui_lang();
+        let (title, message) = match lang {
+            GuiLang::Polish => (
+                "Zaawansowane ustawienia paska zadań",
+                "Aplikacja TaskbarUnlocked jest już zainstalowana w systemie.\n\n\
+                 Co chcesz zrobić?\n\n\
+                 • Kliknij [Tak], aby uruchomić / naprawić działanie paska zadań teraz.\n\
+                 • Kliknij [Nie], aby całkowicie odinstalować aplikację i przywrócić pasek zadań na monitor główny.\n\
+                 • Kliknij [Anuluj], aby nie wprowadzać żadnych zmian.",
+            ),
+            GuiLang::English => (
+                "Advanced Taskbar Settings",
+                "TaskbarUnlocked is already installed on this system.\n\n\
+                 What would you like to do?\n\n\
+                 • Click [Yes] to run / repair the taskbar now.\n\
+                 • Click [No] to completely uninstall the application and restore the taskbar to the primary display.\n\
+                 • Click [Cancel] to exit without making changes.",
+            ),
+        };
+
+        let res = unsafe {
+            MessageBoxW(
+                HWND::default(),
+                PCWSTR(to_wide(message).as_ptr()),
+                PCWSTR(to_wide(title).as_ptr()),
+                MB_YESNOCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND,
+            )
+        };
+
+        match res {
+            IDYES => perform_install(),
+            IDNO => perform_uninstall(),
+            _ => Ok(()),
+        }
     } else {
         perform_install()
     }
 }
-
-

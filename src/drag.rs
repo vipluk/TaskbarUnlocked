@@ -189,7 +189,9 @@ impl TaskbarDragController {
         pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom
     }
 
+    #[allow(dead_code)]
     fn is_point_on_start_or_tray_notify(tray_hwnd: HWND, pt: POINT) -> bool {
+
         unsafe {
             for class_name in [w!("Start"), w!("TrayNotifyWnd")] {
                 if let Ok(child) = FindWindowExW(tray_hwnd, HWND::default(), class_name, None) {
@@ -281,7 +283,6 @@ impl TaskbarDragController {
                     let mut tray_rc = RECT::default();
                     if unsafe { GetWindowRect(tray_hwnd, &mut tray_rc) }.is_ok()
                         && Self::point_in_rect(pt, &tray_rc)
-                        && !Self::is_point_on_start_or_tray_notify(tray_hwnd, pt)
                     {
                         self.phase = DragPhase::PressedOnTaskbar {
                             origin: pt,
@@ -291,6 +292,7 @@ impl TaskbarDragController {
                 }
                 None
             }
+
             DragPhase::PressedOnTaskbar { origin, .. } => {
                 if !lbutton_down {
                     self.phase = DragPhase::Idle;

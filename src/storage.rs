@@ -10,6 +10,10 @@ use windows::Win32::System::Registry::{
 use crate::monitor::DockEdge;
 use crate::taskbar::TaskbarState;
 
+fn default_one() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppDiskStorage {
     pub baseline: WindowsBaseline,
@@ -20,6 +24,12 @@ pub struct AppDiskStorage {
 pub struct WindowsBaseline {
     pub searchbox_mode: u32,
     pub searchbox_mode_cache: u32,
+    #[serde(default = "default_one")]
+    pub widgets_mode: u32,
+    #[serde(default = "default_one")]
+    pub task_view_mode: u32,
+    #[serde(default)]
+    pub chat_mode: u32,
     pub taskbar_location: u32,
     pub stuck_rects3_binary: Vec<u8>,
     pub created_at: String,
@@ -29,6 +39,14 @@ pub struct WindowsBaseline {
 pub struct UserPreferences {
     pub horizontal_search_mode: u32,
     pub vertical_search_mode: u32,
+    #[serde(default = "default_one")]
+    pub horizontal_widgets_mode: u32,
+    #[serde(default = "default_one")]
+    pub horizontal_task_view_mode: u32,
+    #[serde(default)]
+    pub horizontal_chat_mode: u32,
+    #[serde(default)]
+    pub last_applied_vertical: bool,
     pub monitor_index: usize,
     pub edge: DockEdge,
     pub locked: bool,
@@ -42,8 +60,12 @@ impl Default for UserPreferences {
         Self {
             horizontal_search_mode: 2,
             vertical_search_mode: 1,
-            monitor_index: 0,
-            edge: DockEdge::Bottom,
+            horizontal_widgets_mode: 1,
+            horizontal_task_view_mode: 1,
+            horizontal_chat_mode: 0,
+            last_applied_vertical: false,
+            monitor_index: 1,
+            edge: DockEdge::Right,
             locked: false,
             lang_mode: 0,
             active: true,
@@ -77,9 +99,44 @@ pub fn get_storage_path() -> PathBuf {
     PathBuf::from("config.json")
 }
 
+fn read_legacy_saved_horizontal_search_mode() -> Option<u32> {
+    unsafe {
+        let mut hkey = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            w!("Software\\TaskbarUnlocked"),
+            0,
+            KEY_READ,
+            &mut hkey,
+        )
+        .is_ok()
+        {
+            let mut val = 0u32;
+            let mut len = 4u32;
+            let ok = RegQueryValueExW(
+                hkey,
+                w!("SavedHorizontalSearchMode"),
+                None,
+                None,
+                Some(&mut val as *mut u32 as *mut u8),
+                Some(&mut len),
+            )
+            .is_ok();
+            let _ = RegCloseKey(hkey);
+            if ok && (val == 2 || val == 3) {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
 pub fn read_current_windows_registry_baseline() -> WindowsBaseline {
     let mut search_mode = 2u32;
     let mut search_mode_cache = 2u32;
+    let mut widgets_mode = 1u32;
+    let mut task_view_mode = 1u32;
+    let mut chat_mode = 0u32;
     let mut taskbar_location = 3u32;
     let mut stuck_rects3 = Vec::new();
 
@@ -135,19 +192,36 @@ pub fn read_current_windows_registry_baseline() -> WindowsBaseline {
         )
         .is_ok()
         {
-            let mut loc = 0u32;
-            let mut len = 4u32;
-            if RegQueryValueExW(
-                adv_key,
-                w!("TaskbarLocation"),
-                None,
-                None,
-                Some(&mut loc as *mut u32 as *mut u8),
-                Some(&mut len),
-            )
-            .is_ok()
-            {
+            let read_adv_dword = |name: windows::core::PCWSTR| -> Option<u32> {
+                let mut v = 0u32;
+                let mut l = 4u32;
+                if RegQueryValueExW(
+                    adv_key,
+                    name,
+                    None,
+                    None,
+                    Some(&mut v as *mut u32 as *mut u8),
+                    Some(&mut l),
+                )
+                .is_ok()
+                {
+                    Some(v)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(loc) = read_adv_dword(w!("TaskbarLocation")) {
                 taskbar_location = loc;
+            }
+            if let Some(w_da) = read_adv_dword(w!("TaskbarDa")) {
+                widgets_mode = w_da;
+            }
+            if let Some(tv) = read_adv_dword(w!("ShowTaskViewButton")) {
+                task_view_mode = tv;
+            }
+            if let Some(mn) = read_adv_dword(w!("TaskbarMn")) {
+                chat_mode = mn;
             }
             let _ = RegCloseKey(adv_key);
         }
@@ -181,10 +255,20 @@ pub fn read_current_windows_registry_baseline() -> WindowsBaseline {
         }
     }
 
+    if let Some(saved_h) = read_legacy_saved_horizontal_search_mode() {
+        if search_mode == 1 && (taskbar_location == 0 || taskbar_location == 2) {
+            search_mode = saved_h;
+            search_mode_cache = saved_h;
+        }
+    }
+
     WindowsBaseline {
         searchbox_mode: search_mode,
         searchbox_mode_cache: search_mode_cache,
-        taskbar_location,
+        widgets_mode,
+        task_view_mode,
+        chat_mode,
+        taskbar_location: 3,
         stuck_rects3_binary: stuck_rects3,
         created_at: current_timestamp(),
     }
@@ -194,7 +278,21 @@ pub fn load_or_init_storage() -> AppDiskStorage {
     let p = get_storage_path();
     if p.exists() {
         if let Ok(data) = std::fs::read_to_string(&p) {
-            if let Ok(parsed) = serde_json::from_str::<AppDiskStorage>(&data) {
+            if let Ok(mut parsed) = serde_json::from_str::<AppDiskStorage>(&data) {
+                let mut repaired = false;
+                if let Some(saved_h) = read_legacy_saved_horizontal_search_mode() {
+                    if parsed.preferences.horizontal_search_mode == 1
+                    {
+                        parsed.baseline.searchbox_mode = saved_h;
+                        parsed.baseline.searchbox_mode_cache = saved_h;
+                        parsed.baseline.taskbar_location = 3;
+                        parsed.preferences.horizontal_search_mode = saved_h;
+                        repaired = true;
+                    }
+                }
+                if repaired {
+                    let _ = save_storage(&parsed);
+                }
                 return parsed;
             }
         }
@@ -204,6 +302,9 @@ pub fn load_or_init_storage() -> AppDiskStorage {
     let mut prefs = UserPreferences::default();
     prefs.horizontal_search_mode = baseline.searchbox_mode;
     prefs.vertical_search_mode = if baseline.searchbox_mode == 0 { 0 } else { 1 };
+    prefs.horizontal_widgets_mode = baseline.widgets_mode;
+    prefs.horizontal_task_view_mode = baseline.task_view_mode;
+    prefs.horizontal_chat_mode = baseline.chat_mode;
 
     let storage = AppDiskStorage {
         baseline,
@@ -226,6 +327,13 @@ pub fn save_storage(storage: &AppDiskStorage) -> Result<()> {
 pub fn restore_windows_baseline() -> Result<()> {
     let storage = load_or_init_storage();
     let b = &storage.baseline;
+    let p = &storage.preferences;
+
+    let restore_search = if p.horizontal_search_mode > 1 {
+        p.horizontal_search_mode
+    } else {
+        b.searchbox_mode
+    };
 
     unsafe {
         let mut key = HKEY::default();
@@ -243,14 +351,14 @@ pub fn restore_windows_baseline() -> Result<()> {
                 w!("SearchboxTaskbarMode"),
                 0,
                 REG_DWORD,
-                Some(&b.searchbox_mode.to_le_bytes()),
+                Some(&restore_search.to_le_bytes()),
             );
             let _ = RegSetValueExW(
                 key,
                 w!("SearchboxTaskbarModeCache"),
                 0,
                 REG_DWORD,
-                Some(&b.searchbox_mode_cache.to_le_bytes()),
+                Some(&restore_search.to_le_bytes()),
             );
             let _ = RegCloseKey(key);
         }
@@ -265,17 +373,32 @@ pub fn restore_windows_baseline() -> Result<()> {
         )
         .is_ok()
         {
+            let bottom_loc = 3u32;
             let _ = RegSetValueExW(
                 adv_key,
                 w!("TaskbarLocation"),
                 0,
                 REG_DWORD,
-                Some(&b.taskbar_location.to_le_bytes()),
+                Some(&bottom_loc.to_le_bytes()),
+            );
+            let _ = RegSetValueExW(
+                adv_key,
+                w!("TaskbarDa"),
+                0,
+                REG_DWORD,
+                Some(&p.horizontal_widgets_mode.to_le_bytes()),
+            );
+            let _ = RegSetValueExW(
+                adv_key,
+                w!("ShowTaskViewButton"),
+                0,
+                REG_DWORD,
+                Some(&p.horizontal_task_view_mode.to_le_bytes()),
             );
             let _ = RegCloseKey(adv_key);
         }
 
-        if !b.stuck_rects3_binary.is_empty() {
+        if !b.stuck_rects3_binary.is_empty() && b.stuck_rects3_binary.len() >= 40 {
             let mut stuck_key = HKEY::default();
             if RegOpenKeyExW(
                 HKEY_CURRENT_USER,
@@ -286,12 +409,15 @@ pub fn restore_windows_baseline() -> Result<()> {
             )
             .is_ok()
             {
+                let mut buf = b.stuck_rects3_binary.clone();
+                let bottom_abe = 3u32;
+                buf[12..16].copy_from_slice(&bottom_abe.to_le_bytes());
                 let _ = RegSetValueExW(
                     stuck_key,
                     w!("Settings"),
                     0,
                     REG_BINARY,
-                    Some(&b.stuck_rects3_binary),
+                    Some(&buf),
                 );
                 let _ = RegCloseKey(stuck_key);
             }
@@ -299,7 +425,7 @@ pub fn restore_windows_baseline() -> Result<()> {
     }
 
     TaskbarState::broadcast_tray_settings();
-    TaskbarState::restart_search_host();
 
     Ok(())
 }
+

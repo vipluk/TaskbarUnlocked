@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+mod autostart;
+mod daemon_log;
 mod drag;
 mod gui;
 mod i18n;
@@ -7,8 +9,9 @@ mod injector;
 mod installer;
 mod ipc;
 mod monitor;
-mod taskbar;
+mod single_instance;
 mod storage;
+mod taskbar;
 mod watcher;
 
 
@@ -30,7 +33,7 @@ use crate::ipc::{disable_legacy_v2_shm, ShmGuard};
 use crate::monitor::{enumerate_monitors, DockEdge};
 use crate::taskbar::{TaskbarState, TaskbarTargetConfig};
 use crate::watcher::{
-    build_shared_config, resolve_hook_dll_path, run_watcher_loop, STOP_REQUESTED,
+    build_shared_config, resolve_hook_dll_path, run_daemon, run_watcher_loop, STOP_REQUESTED,
 };
 
 
@@ -74,6 +77,14 @@ pub struct Cli {
     /// Wymuś deinstalację aplikacji i przywrócenie systemu do normalności
     #[arg(long)]
     pub uninstall: bool,
+
+    /// (Wewnętrzne) Zarejestruj zadanie Harmonogramu z podniesionymi uprawnieniami
+    #[arg(long, hide = true)]
+    pub register_task: bool,
+
+    /// (Wewnętrzne) Wyrejestruj zadanie Harmonogramu z podniesionymi uprawnieniami
+    #[arg(long, hide = true)]
+    pub unregister_task: bool,
 
     /// Wylistuj wszystkie wykryte monitory wraz z ich indeksami oraz wymiarami i zakończ
     #[arg(long)]
@@ -164,6 +175,17 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    if cli.register_task {
+        let cur_exe = std::env::current_exe()?;
+        let ok = crate::autostart::register_task_direct(&cur_exe)?;
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
+    if cli.unregister_task {
+        let ok = crate::autostart::unregister_task_direct();
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     if cli.install {
         return perform_install();
     }
@@ -182,6 +204,11 @@ fn main() -> Result<()> {
 
     if cli.daemon {
         let saved = load_persisted_settings();
+        if !saved.active {
+            crate::daemon_log::log_line("Uruchomiono --daemon, ale aplikacja jest oznaczona jako nieaktywna (active=false). Zamykanie.");
+            return Ok(());
+        }
+
         TaskbarState::update_registry_taskbar_location(saved.edge);
         let config = TaskbarTargetConfig {
             target_monitor_index: saved.monitor_index,
@@ -192,7 +219,7 @@ fn main() -> Result<()> {
         ctrlc::set_handler(move || {
             STOP_REQUESTED.store(true, Ordering::SeqCst);
         })?;
-        return run_watcher_loop(config);
+        return run_daemon(config);
     }
 
     let edge: DockEdge = cli.edge.into();
@@ -264,6 +291,40 @@ fn main() -> Result<()> {
     }
 
     run_watcher_loop(config)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_inspect_taskbar() {
+        use windows::core::w;
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowExW, FindWindowW, GetClassNameW, GetWindowRect,
+        };
+        unsafe {
+            let tray = FindWindowW(w!("Shell_TrayWnd"), None).unwrap_or_default();
+            println!("Tray HWND: {:?}", tray.0);
+            if !tray.0.is_null() {
+                let mut rc = RECT::default();
+                let _ = GetWindowRect(tray, &mut rc);
+                println!("Shell_TrayWnd RECT: {:?}", rc);
+                let mut child = HWND::default();
+                while let Ok(next) = FindWindowExW(tray, child, None, None) {
+                    if next.0.is_null() {
+                        break;
+                    }
+                    child = next;
+                    let mut buf = [0u16; 256];
+                    let len = GetClassNameW(child, &mut buf);
+                    let name = String::from_utf16_lossy(&buf[..len as usize]);
+                    let mut crc = RECT::default();
+                    let _ = GetWindowRect(child, &mut crc);
+                    println!("  Child [{}]: {:?}", name, crc);
+                }
+            }
+        }
+    }
 }
 
 
