@@ -47,6 +47,9 @@ This application has been built and tested on the following system configuration
 | **Kernel Version** | 10.0.26340.9767 |
 | **Architecture** | x86_64 (64-bit) |
 
+> [!NOTE]
+> Conceived, directed, and tested on real hardware by human oversight, with the entire codebase implemented by advanced AI reasoning models primarily from Google alongside Anthropic (no OpenAI models were used).
+
 ---
 
 ## 🚀 Quick Start & Installation
