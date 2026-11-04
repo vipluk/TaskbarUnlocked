@@ -358,41 +358,22 @@ fn restore_to_primary(selected_monitor: usize, _selected_edge: DockEdge, lang: G
     Ok(())
 }
 
-fn refresh_control_labels(hwnd: HWND, lang: GuiLang, selected_edge: DockEdge, btns: ButtonHandles) {
+fn refresh_control_labels(hwnd: HWND, lang: GuiLang, _selected_edge: DockEdge, btns: ButtonHandles) {
     let s = get_gui_strings(lang);
-    let edge_label = |edge: DockEdge, base: &str| -> String {
-        if selected_edge == edge {
-            format!("● {}", base)
-        } else {
-            format!("○ {}", base)
-        }
-    };
 
     unsafe {
         let _ = SetWindowTextW(hwnd, PCWSTR(to_wide(s.window_title).as_ptr()));
-        let _ = SetWindowTextW(
-            btns.btn_left,
-            PCWSTR(to_wide(&edge_label(DockEdge::Left, s.edge_left)).as_ptr()),
-        );
-        let _ = SetWindowTextW(
-            btns.btn_right,
-            PCWSTR(to_wide(&edge_label(DockEdge::Right, s.edge_right)).as_ptr()),
-        );
-        let _ = SetWindowTextW(
-            btns.btn_top,
-            PCWSTR(to_wide(&edge_label(DockEdge::Top, s.edge_top)).as_ptr()),
-        );
-        let _ = SetWindowTextW(
-            btns.btn_bottom,
-            PCWSTR(to_wide(&edge_label(DockEdge::Bottom, s.edge_bottom)).as_ptr()),
-        );
+        let _ = SetWindowTextW(btns.btn_bottom, PCWSTR(to_wide(s.edge_bottom).as_ptr()));
+        let _ = SetWindowTextW(btns.btn_top, PCWSTR(to_wide(s.edge_top).as_ptr()));
+        let _ = SetWindowTextW(btns.btn_left, PCWSTR(to_wide(s.edge_left).as_ptr()));
+        let _ = SetWindowTextW(btns.btn_right, PCWSTR(to_wide(s.edge_right).as_ptr()));
         let _ = SetWindowTextW(btns.btn_restore, PCWSTR(to_wide(s.btn_restore).as_ptr()));
         let _ = SetWindowTextW(btns.chk_lock, PCWSTR(to_wide(s.lock_taskbar).as_ptr()));
         for b in [
+            btns.btn_bottom,
+            btns.btn_top,
             btns.btn_left,
             btns.btn_right,
-            btns.btn_top,
-            btns.btn_bottom,
             btns.btn_restore,
             btns.chk_lock,
         ] {
@@ -691,10 +672,10 @@ unsafe extern "system" fn gui_wnd_proc(
                 b
             };
 
-            let btn_left = make_btn(ID_BTN_EDGE_LEFT, 24, 354, 138, 36);
-            let btn_right = make_btn(ID_BTN_EDGE_RIGHT, 172, 354, 138, 36);
-            let btn_top = make_btn(ID_BTN_EDGE_TOP, 320, 354, 138, 36);
-            let btn_bottom = make_btn(ID_BTN_EDGE_BOTTOM, 468, 354, 138, 36);
+            let btn_bottom = make_btn(ID_BTN_EDGE_BOTTOM, 24, 354, 138, 36);
+            let btn_top = make_btn(ID_BTN_EDGE_TOP, 172, 354, 138, 36);
+            let btn_left = make_btn(ID_BTN_EDGE_LEFT, 320, 354, 138, 36);
+            let btn_right = make_btn(ID_BTN_EDGE_RIGHT, 468, 354, 138, 36);
 
             let btn_restore = make_btn(ID_BTN_RESTORE, 24, 402, 582, 36);
 
@@ -824,18 +805,10 @@ unsafe extern "system" fn gui_wnd_proc(
                         let _ = DeleteObject(brush);
 
                         let text = match ctrl_id {
-                            ID_BTN_EDGE_LEFT => {
-                                if is_active_edge { format!("● {}", s.edge_left) } else { format!("○ {}", s.edge_left) }
-                            }
-                            ID_BTN_EDGE_RIGHT => {
-                                if is_active_edge { format!("● {}", s.edge_right) } else { format!("○ {}", s.edge_right) }
-                            }
-                            ID_BTN_EDGE_TOP => {
-                                if is_active_edge { format!("● {}", s.edge_top) } else { format!("○ {}", s.edge_top) }
-                            }
-                            ID_BTN_EDGE_BOTTOM => {
-                                if is_active_edge { format!("● {}", s.edge_bottom) } else { format!("○ {}", s.edge_bottom) }
-                            }
+                            ID_BTN_EDGE_BOTTOM => s.edge_bottom.to_string(),
+                            ID_BTN_EDGE_TOP => s.edge_top.to_string(),
+                            ID_BTN_EDGE_LEFT => s.edge_left.to_string(),
+                            ID_BTN_EDGE_RIGHT => s.edge_right.to_string(),
                             ID_BTN_RESTORE => s.btn_restore.to_string(),
                             _ => String::new(),
                         };
