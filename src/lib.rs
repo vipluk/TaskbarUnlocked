@@ -108,9 +108,6 @@ fn ensure_tray_subclassed(tray: HWND) {
     if tray.0.is_null() {
         return;
     }
-    if !crate::context_menu::is_context_menu_hooked() {
-        crate::context_menu::init_context_menu_hooks();
-    }
     let key = tray.0 as isize;
     if SUBCLASSED_TRAY_HWND.load(Ordering::Acquire) == key {
         return;

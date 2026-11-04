@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use retour::RawDetour;
 use windows::core::{w, GUID, HSTRING};
@@ -100,7 +100,8 @@ fn read_context_menu_config_from_shm() -> (bool, bool, u32, Option<String>) {
             return (enabled, locked, cfg.lang_mode, path);
         }
     }
-    (false, false, 0, None)
+    // Domyślnie włączone jeśli biblioteka jest wstrzyknięta do explorer.exe:
+    (true, false, 0, None)
 }
 
 fn toggle_locked_state_in_shm_and_registry() {
@@ -202,6 +203,7 @@ unsafe extern "system" fn hooked_create_menu_flyout_item(
     let has_glyph = ((opt_glyph >> 32) & 0xFF) != 0;
     if has_glyph && glyph_code == GLYPH_CODE_TASKBAR_SETTINGS {
         APPEND_AFTER_SETTINGS_ITEM.with(|f| f.set(true));
+        crate::daemon_log::log_line("[ctx_menu] Wykryto natywną pozycję Ustawienia paska zadań (0xE115)");
     }
 
     orig(out_item, text, opt_auto_id, opt_glyph, handler)
@@ -269,6 +271,7 @@ unsafe extern "system" fn hooked_ivector_append(
     let should_append_custom = APPEND_AFTER_SETTINGS_ITEM.with(|f| f.replace(false));
     if should_append_custom {
         let (enabled, locked, _lang_mode, _) = read_context_menu_config_from_shm();
+        crate::daemon_log::log_line(format!("[ctx_menu] Dołączanie własnych pozycji do menu (enabled={}, locked={})", enabled, locked));
         if !enabled {
             return res;
         }
@@ -806,6 +809,7 @@ unsafe fn patch_vertical_search_icon_layout(text_start: usize, text_len: usize) 
     ));
 }
 
+static INIT_MUTEX: Mutex<()> = Mutex::new(());
 static RETRY_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 
 pub fn is_context_menu_hooked() -> bool {
@@ -816,14 +820,25 @@ pub fn try_init_context_menu_hooks() -> bool {
     if is_context_menu_hooked() {
         return true;
     }
+    let _guard = match INIT_MUTEX.try_lock() {
+        Ok(g) => g,
+        Err(_) => return is_context_menu_hooked(),
+    };
+    if is_context_menu_hooked() {
+        return true;
+    }
     unsafe {
         if let Some(hooks) = scan_taskbar_view_and_install() {
-            let _ = CTX_MENU_HOOKS.set(hooks);
-            if let Some(h) = CTX_MENU_HOOKS.get() {
-                let _ = h.detour_create_item.enable();
-                let _ = h.detour_append.enable();
-                let _ = h.detour_invoke.enable();
-                crate::daemon_log::log_line("[ctx_menu] Hooki menu kontekstowego zostały aktywowane pomyślnie!");
+            if CTX_MENU_HOOKS.set(hooks).is_ok() {
+                if let Some(h) = CTX_MENU_HOOKS.get() {
+                    let _ = h.detour_create_item.enable();
+                    let _ = h.detour_append.enable();
+                    let _ = h.detour_invoke.enable();
+                    crate::daemon_log::log_line("[ctx_menu] SUKCES: Hooki menu kontekstowego zostały aktywowane pomyślnie!");
+                    return true;
+                }
+            } else {
+                crate::daemon_log::log_line("[ctx_menu] Informacja: Hooki były już wcześniej zarejestrowane.");
                 return true;
             }
         }
