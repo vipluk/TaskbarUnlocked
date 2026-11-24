@@ -765,18 +765,22 @@ unsafe fn patch_vertical_search_icon_layout(text_start: usize, text_len: usize) 
     }
 
     // 2. ExperienceToggleButton::UpdateButtonMetrics:
-    // Wzorzec: 48 8D 9F 58 04 00 00 83 BF 38 01 00 00 00 74 27
-    // Zamieniamy `74 27` (je +0x27) na `EB 27` (jmp +0x27), aby w pionie nie zerować marginesu ikony SearchButton.
+    // Wzorzec (RBX w 26H2 lub RDI w 22H2-24H2):
+    // 48 8D (BB|9F) 58 04 00 00 83 (BB|BF) 38 01 00 00 00 74 27
+    // Zamieniamy `74 27` (je +0x27) na `EB 27` (jmp +0x27), aby w pionie SearchButton
+    // zachowywał domyślny symetryczny margines ikony tak samo jak StartButton i TaskViewButton.
     for i in 0..slice.len().saturating_sub(18) {
+        let lea_reg_ok = slice[i + 2] == 0xBB || slice[i + 2] == 0x9F;
+        let cmp_reg_ok = slice[i + 8] == 0xBB || slice[i + 8] == 0xBF;
         if slice[i] == 0x48
             && slice[i + 1] == 0x8D
-            && slice[i + 2] == 0x9F
+            && lea_reg_ok
             && slice[i + 3] == 0x58
             && slice[i + 4] == 0x04
             && slice[i + 5] == 0x00
             && slice[i + 6] == 0x00
             && slice[i + 7] == 0x83
-            && slice[i + 8] == 0xBF
+            && cmp_reg_ok
             && slice[i + 9] == 0x38
             && slice[i + 10] == 0x01
             && slice[i + 11] == 0x00
@@ -805,8 +809,8 @@ unsafe fn patch_vertical_search_icon_layout(text_start: usize, text_len: usize) 
 
     crate::daemon_log::log_line(format!(
         "[ctx_menu] Patch ikony wyszukiwarki: UpdateColumnWidths={}, UpdateButtonMetrics={}",
-        if patched_widths { "TAK" } else { "POMINIĘTO (inna wersja)" },
-        if patched_metrics { "TAK" } else { "POMINIĘTO (inna wersja)" }
+        if patched_widths { "TAK" } else { "POMINIĘTO" },
+        if patched_metrics { "TAK" } else { "POMINIĘTO" }
     ));
 }
 
@@ -836,6 +840,13 @@ pub fn try_init_context_menu_hooks() -> bool {
                     let _ = h.detour_append.enable();
                     let _ = h.detour_invoke.enable();
                     crate::daemon_log::log_line("[ctx_menu] SUKCES: Hooki menu kontekstowego zostały aktywowane pomyślnie!");
+                    if let Some(shm) = ShmGuard::open_existing() {
+                        if let Some(cfg) = shm.read() {
+                            if cfg.active != 0 && (cfg.edge == 0 || cfg.edge == 2) {
+                                crate::taskbar::TaskbarState::broadcast_tray_settings();
+                            }
+                        }
+                    }
                     return true;
                 }
             } else {

@@ -57,7 +57,7 @@ impl From<EdgeArg> for DockEdge {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "taskbar-unlocked")]
+#[command(name = "taskbar-unlocked", version)]
 #[command(
     about = "Odkleja główny pasek zadań Windows 11 z monitora głównego. Uruchomienie bez argumentów instaluje lub odinstalowuje aplikację (jak ExplorerPatcher)."
 )]
@@ -209,7 +209,6 @@ fn main() -> Result<()> {
             return Ok(());
         }
 
-        TaskbarState::update_registry_taskbar_location(saved.edge);
         let config = TaskbarTargetConfig {
             target_monitor_index: saved.monitor_index,
             edge: saved.edge,
@@ -264,10 +263,7 @@ fn main() -> Result<()> {
         let monitors = enumerate_monitors()?;
         let primary = crate::monitor::get_primary_monitor(&monitors)?;
         let target = crate::monitor::get_target_monitor(&monitors, config.target_monitor_index)?;
-        TaskbarState::update_registry_taskbar_location(config.edge);
-        TaskbarState::adapt_searchbox_for_edge(config.edge);
         let mut state = TaskbarState::locate(&target, config.edge, config.size_override)?;
-        TaskbarState::update_registry_stuck_rects3(config.edge, &state.desired_rect);
         let prev = load_persisted_settings();
         save_persisted_settings(&PersistedSettings {
             active: true,
@@ -277,8 +273,22 @@ fn main() -> Result<()> {
             lang_mode: prev.lang_mode,
         });
 
+        if let Some(existing_shm) = ShmGuard::open_existing() {
+            if existing_shm.read().map(|c| c.active != 0).unwrap_or(false) {
+                let shm_cfg = build_shared_config(true, &config, &primary, &target, &state);
+                existing_shm.write(&shm_cfg);
+                println!(
+                    "Zlecono aktywnemu demonowi przeniesienie paska zadań na monitor #{} ({:?}).",
+                    config.target_monitor_index, config.edge
+                );
+                return Ok(());
+            }
+        }
+
+        TaskbarState::update_registry_taskbar_location(config.edge);
+        TaskbarState::update_registry_stuck_rects3(config.edge, &state.desired_rect);
         let shm = ShmGuard::create_or_open()?;
-        let shm_cfg = build_shared_config(true, &config, &primary, &target, &state);
+        let mut shm_cfg = build_shared_config(true, &config, &primary, &target, &state);
         shm.write(&shm_cfg);
         let dll_path = resolve_hook_dll_path()?;
         let _ = ensure_hook_dll_injected(state.process_id, &dll_path)?;
@@ -287,7 +297,25 @@ fn main() -> Result<()> {
         }
         state.enforce_position()?;
         state.notify_tray_layout_refresh();
+        TaskbarState::remember_search_mode_and_adapt_widgets(config.edge);
         TaskbarState::update_work_areas(&primary, &target, &state.desired_rect, config.edge)?;
+        if matches!(config.edge, DockEdge::Left | DockEdge::Right) {
+            std::thread::sleep(std::time::Duration::from_millis(110));
+            let full_rect = state.desired_rect;
+            let mut nudge_rect = full_rect;
+            if (nudge_rect.bottom - nudge_rect.top) > 64 {
+                nudge_rect.bottom -= 1;
+            }
+            state.desired_rect = nudge_rect;
+            shm_cfg.desired_taskbar_rect = nudge_rect;
+            shm.write(&shm_cfg);
+            let _ = state.enforce_position_with_frame_refresh();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            state.desired_rect = full_rect;
+            shm_cfg.desired_taskbar_rect = full_rect;
+            shm.write(&shm_cfg);
+            let _ = state.enforce_position_with_frame_refresh();
+        }
         println!(
             "Przeniesiono pasek zadań na monitor #{} wraz z aktywnym hookiem wewnątrz explorer.exe.",
             config.target_monitor_index

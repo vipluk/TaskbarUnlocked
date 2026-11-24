@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
-use crate::monitor::{enumerate_monitors, DockEdge, MonitorDescriptor};
+use crate::monitor::{enumerate_monitors_fast, DockEdge, MonitorDescriptor};
 use crate::taskbar::TaskbarState;
 
 static OVERLAY_ACCENT_COLOR: AtomicU32 = AtomicU32::new(0x00C0_6700);
@@ -323,7 +323,7 @@ impl TaskbarDragController {
                     let dy = (pt.y - origin.y).abs();
                     let outside_taskbar = !Self::point_in_rect(pt, &tray_rect);
                     if dx >= 24 || dy >= 24 || outside_taskbar {
-                        if let Ok(monitors) = enumerate_monitors() {
+                        if let Ok(monitors) = enumerate_monitors_fast() {
                             if let Some((mon_idx, edge, preview_rc)) =
                                 Self::pick_monitor_and_edge(pt, &monitors)
                             {
@@ -348,7 +348,7 @@ impl TaskbarDragController {
                 candidate_edge,
             } => {
                 if lbutton_down {
-                    if let Ok(monitors) = enumerate_monitors() {
+                    if let Ok(monitors) = enumerate_monitors_fast() {
                         if let Some((mon_idx, edge, preview_rc)) =
                             Self::pick_monitor_and_edge(pt, &monitors)
                         {

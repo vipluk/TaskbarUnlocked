@@ -1,21 +1,35 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::{anyhow, Context, Result};
 use windows::core::w;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, FindWindowW, GetSystemMetrics, GetWindowRect,
-    GetWindowThreadProcessId, IsWindow, IsWindowVisible, IsZoomed, SendNotifyMessageW,
-    SetWindowPos, ShowWindow, SystemParametersInfoW, HWND_BROADCAST, HWND_TOP, SM_CXPADDEDBORDER,
-    SM_CXSIZEFRAME, SM_CYSIZEFRAME, SPIF_UPDATEINIFILE, SPI_SETWORKAREA, SWP_ASYNCWINDOWPOS,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
-    SW_SHOWNA, WM_SETTINGCHANGE,
+    EnumWindows, FindWindowExW, FindWindowW, GetForegroundWindow, GetSystemMetrics,
+    GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+    IsZoomed, SendNotifyMessageW, SetWindowPos, ShowWindow, SystemParametersInfoW, GWL_EXSTYLE,
+    GWL_STYLE, HWND_BROADCAST, HWND_TOP, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME,
+    SPIF_UPDATEINIFILE, SPI_SETWORKAREA, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SETTINGCHANGE, WS_CAPTION, WS_EX_TOOLWINDOW,
+    WS_THICKFRAME,
 };
 
 
 
 use crate::monitor::{DockEdge, MonitorDescriptor};
+
+pub static LAST_WORKAREA_BROADCAST_MS: AtomicU64 = AtomicU64::new(0);
+static CC_VISIBLE_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+
+pub fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 fn get_current_work_rect(hmonitor: HMONITOR) -> Option<RECT> {
     let mut info = MONITORINFO {
@@ -35,19 +49,20 @@ fn rects_equal(a: &RECT, b: &RECT) -> bool {
 }
 
 #[repr(C)]
-struct MaxWinAdjustCtx {
+struct WinAdjustCtx {
     monitor: HMONITOR,
-    work_rect: RECT,
+    old_work: RECT,
+    new_work: RECT,
 }
 
-unsafe extern "system" fn adjust_maximized_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+unsafe extern "system" fn adjust_windows_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if lparam.0 == 0 {
         return BOOL(1);
     }
-    if !IsWindowVisible(hwnd).as_bool() || !IsZoomed(hwnd).as_bool() {
+    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
         return BOOL(1);
     }
-    let ctx = &*(lparam.0 as *const MaxWinAdjustCtx);
+    let ctx = &*(lparam.0 as *const WinAdjustCtx);
     let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
     if mon != ctx.monitor {
         return BOOL(1);
@@ -61,39 +76,124 @@ unsafe extern "system" fn adjust_maximized_enum_proc(hwnd: HWND, lparam: LPARAM)
     let pad_x = (GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER)).clamp(0, 16);
     let pad_y = (GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER)).clamp(0, 16);
 
-    let expected = RECT {
-        left: ctx.work_rect.left - pad_x,
-        top: ctx.work_rect.top - pad_y,
-        right: ctx.work_rect.right + pad_x,
-        bottom: ctx.work_rect.bottom + pad_y,
-    };
+    if IsZoomed(hwnd).as_bool() {
+        let expected = RECT {
+            left: ctx.new_work.left - pad_x,
+            top: ctx.new_work.top - pad_y,
+            right: ctx.new_work.right + pad_x,
+            bottom: ctx.new_work.bottom + pad_y,
+        };
 
-    if !rects_equal(&win_rc, &expected) {
+        if !rects_equal(&win_rc, &expected) {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                expected.left,
+                expected.top,
+                expected.right - expected.left,
+                expected.bottom - expected.top,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS,
+            );
+        }
+        return BOOL(1);
+    }
+
+    // Dla normalnych, przesuwalnych okien top-level (np. zadokowanych przez Aero Snap lub nachodzących na nowy pasek zadań):
+    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if (ex_style & WS_EX_TOOLWINDOW.0) != 0 || (style & (WS_CAPTION.0 | WS_THICKFRAME.0)) == 0 {
+        return BOOL(1);
+    }
+
+    let min_x = ctx.new_work.left - pad_x;
+    let min_y = ctx.new_work.top;
+    let max_x = ctx.new_work.right + pad_x;
+    let max_y = ctx.new_work.bottom + pad_y;
+
+    let old_min_x = ctx.old_work.left - pad_x;
+    let old_min_y = ctx.old_work.top;
+    let old_max_x = ctx.old_work.right + pad_x;
+    let old_max_y = ctx.old_work.bottom + pad_y;
+
+    let mut new_rc = win_rc;
+    let w = win_rc.right - win_rc.left;
+    let h = win_rc.bottom - win_rc.top;
+    let max_w = (max_x - min_x).max(200);
+    let max_h = (max_y - min_y).max(150);
+
+    let snapped_full_v = (win_rc.top - old_min_y).abs() <= 12 && (win_rc.bottom - old_max_y).abs() <= 12;
+    let snapped_full_h = (win_rc.left - old_min_x).abs() <= 12 && (win_rc.right - old_max_x).abs() <= 12;
+
+    if snapped_full_v {
+        new_rc.top = min_y;
+        new_rc.bottom = max_y;
+    } else {
+        if new_rc.top < min_y {
+            let shift = min_y - new_rc.top;
+            new_rc.top += shift;
+            new_rc.bottom = (new_rc.bottom + shift).min(max_y);
+        }
+        if new_rc.bottom > max_y {
+            let shift = new_rc.bottom - max_y;
+            new_rc.bottom -= shift;
+            new_rc.top = (new_rc.top - shift).max(min_y);
+        }
+        if new_rc.bottom - new_rc.top > max_h && h <= (old_max_y - old_min_y + 16) {
+            new_rc.bottom = new_rc.top + max_h;
+        }
+    }
+
+    if snapped_full_h {
+        new_rc.left = min_x;
+        new_rc.right = max_x;
+    } else {
+        if new_rc.left < min_x {
+            let shift = min_x - new_rc.left;
+            new_rc.left += shift;
+            new_rc.right = (new_rc.right + shift).min(max_x);
+        }
+        if new_rc.right > max_x {
+            let shift = new_rc.right - max_x;
+            new_rc.right -= shift;
+            new_rc.left = (new_rc.left - shift).max(min_x);
+        }
+        if new_rc.right - new_rc.left > max_w && w <= (old_max_x - old_min_x + 16) {
+            new_rc.right = new_rc.left + max_w;
+        }
+    }
+
+    if !rects_equal(&win_rc, &new_rc) {
         let _ = SetWindowPos(
             hwnd,
             HWND_TOP,
-            expected.left,
-            expected.top,
-            expected.right - expected.left,
-            expected.bottom - expected.top,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS,
+            new_rc.left,
+            new_rc.top,
+            new_rc.right - new_rc.left,
+            new_rc.bottom - new_rc.top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
         );
     }
+
     BOOL(1)
 }
 
-
-pub fn adjust_maximized_windows_for_monitor(monitor: HMONITOR, work_rect: &RECT) {
-    let ctx = MaxWinAdjustCtx {
+pub fn adjust_windows_for_monitor(monitor: HMONITOR, old_work: &RECT, new_work: &RECT) {
+    let ctx = WinAdjustCtx {
         monitor,
-        work_rect: *work_rect,
+        old_work: *old_work,
+        new_work: *new_work,
     };
     unsafe {
         let _ = EnumWindows(
-            Some(adjust_maximized_enum_proc),
-            LPARAM(&ctx as *const MaxWinAdjustCtx as isize),
+            Some(adjust_windows_enum_proc),
+            LPARAM(&ctx as *const WinAdjustCtx as isize),
         );
     }
+}
+
+#[allow(dead_code)]
+pub fn adjust_maximized_windows_for_monitor(monitor: HMONITOR, work_rect: &RECT) {
+    adjust_windows_for_monitor(monitor, work_rect, work_rect);
 }
 
 
@@ -364,15 +464,8 @@ impl TaskbarState {
     }
 
     pub fn broadcast_tray_settings() {
-        use windows::Win32::Foundation::WPARAM;
         unsafe {
             let tray_str = w!("TraySettings");
-            let _ = SendNotifyMessageW(
-                HWND_BROADCAST,
-                WM_SETTINGCHANGE,
-                WPARAM(0),
-                LPARAM(tray_str.as_ptr() as isize),
-            );
             if let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) {
                 if !tray.0.is_null() {
                     let _ = SendNotifyMessageW(
@@ -386,10 +479,9 @@ impl TaskbarState {
         }
     }
 
-    pub fn adapt_searchbox_for_edge(edge: DockEdge) {
+    pub fn remember_search_mode_and_adapt_widgets(edge: DockEdge) {
         use windows::Win32::System::Registry::{
-            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-            KEY_READ, KEY_SET_VALUE, REG_DWORD,
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
         };
 
         let is_vertical = matches!(edge, DockEdge::Left | DockEdge::Right);
@@ -403,116 +495,32 @@ impl TaskbarState {
                 HKEY_CURRENT_USER,
                 w!("Software\\Microsoft\\Windows\\CurrentVersion\\Search"),
                 0,
-                KEY_READ | KEY_SET_VALUE,
+                KEY_READ,
                 &mut search_key,
             )
             .is_ok()
             {
                 let mut current_mode: u32 = 0;
                 let mut len = std::mem::size_of::<u32>() as u32;
-                let q_res = RegQueryValueExW(
+                if RegQueryValueExW(
                     search_key,
                     w!("SearchboxTaskbarMode"),
                     None,
                     None,
                     Some(&mut current_mode as *mut u32 as *mut u8),
                     Some(&mut len),
-                );
-
-                if is_vertical {
-                    // Gdy przechodzimy z poziomu w pion (!last_applied_vertical),
-                    // zapisujemy aktualny wybór użytkownika z poziomu (0=ukryte, 1=ikona, 2=etykieta, 3=pole).
-                    // Jeśli już byliśmy w pionie, aktualizujemy horizontal_search_mode tylko gdy w rejestrze
-                    // pojawił się jawny tryb poziomy (2 lub 3).
-                    if q_res.is_ok() {
-                        if !storage.preferences.last_applied_vertical {
-                            if storage.preferences.horizontal_search_mode != current_mode {
-                                storage.preferences.horizontal_search_mode = current_mode;
-                                storage_changed = true;
-                            }
-                        } else if (current_mode == 2 || current_mode == 3)
-                            && storage.preferences.horizontal_search_mode != current_mode
-                        {
-                            storage.preferences.horizontal_search_mode = current_mode;
-                            storage_changed = true;
-                        }
-                    }
-
-
-                    // Logika przejść dla pionu:
-                    // - jeśli użytkownik miał ukryte (0) -> w obu orientacjach ukryte (0)
-                    // - jeśli użytkownik miał ikonę (1) -> w obu orientacjach ikona (1)
-                    // - jeśli użytkownik miał pole (2 lub 3) -> w pionie ikona (1)
-                    let target_vertical_mode = match storage.preferences.horizontal_search_mode {
-                        0 => 0u32,
-                        1 => 1u32,
-                        _ => 1u32,
-                    };
-                    if storage.preferences.vertical_search_mode != target_vertical_mode {
-                        storage.preferences.vertical_search_mode = target_vertical_mode;
-                        storage_changed = true;
-                    }
-
-                    if !q_res.is_ok() || current_mode != target_vertical_mode {
-                        let _ = RegSetValueExW(
-                            search_key,
-                            w!("SearchboxTaskbarMode"),
-                            0,
-                            REG_DWORD,
-                            Some(&target_vertical_mode.to_le_bytes()),
-                        );
-                        let _ = RegSetValueExW(
-                            search_key,
-                            w!("SearchboxTaskbarModeCache"),
-                            0,
-                            REG_DWORD,
-                            Some(&target_vertical_mode.to_le_bytes()),
-                        );
-                        reg_changed = true;
-                    }
-                } else {
-                    if q_res.is_ok() {
-                        if storage.preferences.last_applied_vertical {
-                            if current_mode == 0 && storage.preferences.vertical_search_mode != 0 {
-                                storage.preferences.horizontal_search_mode = 0;
-                                storage_changed = true;
-                            } else if current_mode >= 2 {
-                                storage.preferences.horizontal_search_mode = current_mode;
-                                storage_changed = true;
-                            } else if current_mode == 1 && storage.preferences.horizontal_search_mode == 0 {
-                                storage.preferences.horizontal_search_mode = 1;
-                                storage_changed = true;
-                            }
-                        } else if storage.preferences.horizontal_search_mode != current_mode {
-                            storage.preferences.horizontal_search_mode = current_mode;
-                            storage_changed = true;
-                        }
-                    }
-
-                    let target_horizontal_mode = storage.preferences.horizontal_search_mode;
-                    if !q_res.is_ok() || current_mode != target_horizontal_mode {
-                        let _ = RegSetValueExW(
-                            search_key,
-                            w!("SearchboxTaskbarMode"),
-                            0,
-                            REG_DWORD,
-                            Some(&target_horizontal_mode.to_le_bytes()),
-                        );
-                        let _ = RegSetValueExW(
-                            search_key,
-                            w!("SearchboxTaskbarModeCache"),
-                            0,
-                            REG_DWORD,
-                            Some(&target_horizontal_mode.to_le_bytes()),
-                        );
-                        reg_changed = true;
-                    }
+                )
+                .is_ok()
+                    && current_mode <= 3
+                    && storage.preferences.horizontal_search_mode != current_mode
+                {
+                    storage.preferences.horizontal_search_mode = current_mode;
+                    storage_changed = true;
                 }
-
-
                 let _ = RegCloseKey(search_key);
             }
         }
+
         Self::adapt_widgets_for_edge(is_vertical, &mut storage, &mut reg_changed, &mut storage_changed);
     }
 
@@ -595,15 +603,18 @@ impl TaskbarState {
             }
         }
 
-        if storage.preferences.last_applied_vertical != is_vertical {
+        let orientation_changed = storage.preferences.last_applied_vertical != is_vertical;
+        if orientation_changed {
             storage.preferences.last_applied_vertical = is_vertical;
-            *storage_changed = true;
+            if let Ok(mut guard) = crate::storage::STORAGE_CACHE.lock() {
+                *guard = Some(storage.clone());
+            }
         }
 
         if *storage_changed {
             let _ = crate::storage::save_storage(storage);
         }
-        if *reg_changed {
+        if *reg_changed || orientation_changed {
             Self::broadcast_tray_settings();
         }
     }
@@ -653,6 +664,109 @@ impl TaskbarState {
                     }
                 }
                 let _ = CloseHandle(snap);
+            }
+        }
+    }
+
+    pub fn compute_control_center_pos(
+        win_w: i32,
+        win_h: i32,
+        target_monitor: &MonitorDescriptor,
+        taskbar_rect: &RECT,
+        edge: DockEdge,
+    ) -> (i32, i32) {
+        let m = target_monitor.monitor_rect;
+        let tb_w = (taskbar_rect.right - taskbar_rect.left).max(48);
+        let tb_h = (taskbar_rect.bottom - taskbar_rect.top).max(48);
+        let dpi = target_monitor.dpi.max(96) as i32;
+
+        match edge {
+            DockEdge::Bottom => {
+                let target_x = m.right - win_w;
+                let target_y = (m.bottom - tb_h) - win_h;
+                (target_x, target_y)
+            }
+            DockEdge::Right => {
+                let target_x = (m.right - tb_w) - win_w;
+                let target_y = m.bottom - win_h;
+                (target_x, target_y)
+            }
+            DockEdge::Left => {
+                let target_x = m.left + tb_w;
+                let target_y = m.bottom - win_h;
+                (target_x, target_y)
+            }
+            DockEdge::Top => {
+                let card_h_with_margin = ((536 * dpi) / 96).clamp(400, win_h);
+                let card_top_in_win = (win_h - card_h_with_margin).max(0);
+                let top_gap = (12 * dpi) / 96;
+                let target_x = m.right - win_w;
+                let target_y = (m.top + tb_h + top_gap) - card_top_in_win;
+                (target_x, target_y)
+            }
+        }
+    }
+
+    pub fn reposition_control_center(
+        target_monitor: &MonitorDescriptor,
+        taskbar_rect: &RECT,
+        edge: DockEdge,
+    ) {
+        unsafe {
+            let Ok(hwnd) = FindWindowExW(
+                HWND::default(),
+                HWND::default(),
+                w!("ControlCenterWindow"),
+                None,
+            ) else {
+                CC_VISIBLE_SINCE_MS.store(0, Ordering::Relaxed);
+                return;
+            };
+            if hwnd.0.is_null() || !IsWindowVisible(hwnd).as_bool() {
+                CC_VISIBLE_SINCE_MS.store(0, Ordering::Relaxed);
+                return;
+            }
+
+            let fg = GetForegroundWindow();
+            if hwnd != fg {
+                return;
+            }
+
+            let now = current_time_ms();
+            let since = CC_VISIBLE_SINCE_MS.load(Ordering::Relaxed);
+            if since == 0 {
+                CC_VISIBLE_SINCE_MS.store(now, Ordering::Relaxed);
+                return;
+            }
+            if now.saturating_sub(since) < 16 {
+                return;
+            }
+
+            let mut cur = RECT::default();
+            if GetWindowRect(hwnd, &mut cur).is_ok() {
+                let win_w = cur.right - cur.left;
+                let win_h = cur.bottom - cur.top;
+                if win_w < 200 || win_h < 200 {
+                    return;
+                }
+                let (target_x, target_y) = Self::compute_control_center_pos(
+                    win_w,
+                    win_h,
+                    target_monitor,
+                    taskbar_rect,
+                    edge,
+                );
+                if cur.left != target_x || cur.top != target_y {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_TOP,
+                        target_x,
+                        target_y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
             }
         }
     }
@@ -729,12 +843,54 @@ impl TaskbarState {
                         0,
                         width,
                         height,
-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                        SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
                     );
                 }
             }
         }
 
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn enforce_position_with_frame_refresh(&self) -> Result<()> {
+        let width = self.desired_rect.right - self.desired_rect.left;
+        let height = self.desired_rect.bottom - self.desired_rect.top;
+
+        unsafe {
+            SetWindowPos(
+                self.main_tray_hwnd,
+                HWND_TOP,
+                self.desired_rect.left,
+                self.desired_rect.top,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS,
+            )
+            .context("SetWindowPos (frame refresh) dla Shell_TrayWnd nie powiodło się")?;
+
+            if let Ok(bridge_hwnd) = FindWindowExW(
+                self.main_tray_hwnd,
+                HWND::default(),
+                w!("Windows.UI.Composition.DesktopWindowContentBridge"),
+                None,
+            ) {
+                if !bridge_hwnd.0.is_null() {
+                    let _ = SetWindowPos(
+                        bridge_hwnd,
+                        HWND_TOP,
+                        0,
+                        0,
+                        width,
+                        height,
+                        SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS,
+                    );
+                }
+            }
+        }
+
+        self.notify_tray_layout_refresh();
+        Self::broadcast_tray_settings();
         Ok(())
     }
 
@@ -783,49 +939,50 @@ impl TaskbarState {
     ) -> Result<()> {
         Self::reposition_start_menu(target_monitor);
 
-        // Przywróć pełny WorkArea na wszystkich pozostałych monitorach (np. po przeciągnięciu paska na inny ekran)
-        if let Ok(all_monitors) = crate::monitor::enumerate_monitors() {
+        let mut any_work_changed = false;
+        let mut adjusted_monitors: Vec<(HMONITOR, RECT, RECT)> = Vec::new();
+
+        // 1. Przywróć pełny WorkArea na wszystkich pozostałych monitorach (np. po przeciągnięciu paska na inny ekran)
+        if let Ok(all_monitors) = crate::monitor::enumerate_monitors_fast() {
             for mon in &all_monitors {
                 if mon.handle != target_monitor.handle {
                     let mut full_rc = mon.monitor_rect;
-                    let needs_reset = get_current_work_rect(mon.handle)
-                        .map(|curr| !rects_equal(&curr, &full_rc))
-                        .unwrap_or(true);
-                    if needs_reset {
+                    let old_work = get_current_work_rect(mon.handle).unwrap_or(full_rc);
+                    if !rects_equal(&old_work, &full_rc) {
                         unsafe {
                             let _ = SystemParametersInfoW(
                                 SPI_SETWORKAREA,
                                 0,
                                 Some(&mut full_rc as *mut RECT as *mut std::ffi::c_void),
-                                SPIF_UPDATEINIFILE,
+                                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
                             );
                         }
-                        adjust_maximized_windows_for_monitor(mon.handle, &full_rc);
+                        any_work_changed = true;
+                        adjusted_monitors.push((mon.handle, old_work, full_rc));
                     }
                 }
             }
         } else if primary_monitor.handle != target_monitor.handle {
             let mut primary_full = primary_monitor.monitor_rect;
-            let needs_primary_update = get_current_work_rect(primary_monitor.handle)
-                .map(|curr| !rects_equal(&curr, &primary_full))
-                .unwrap_or(true);
+            let old_primary_work =
+                get_current_work_rect(primary_monitor.handle).unwrap_or(primary_full);
 
-            if needs_primary_update {
+            if !rects_equal(&old_primary_work, &primary_full) {
                 unsafe {
                     SystemParametersInfoW(
                         SPI_SETWORKAREA,
                         0,
                         Some(&mut primary_full as *mut RECT as *mut std::ffi::c_void),
-                        SPIF_UPDATEINIFILE,
+                        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
                     )
                     .context("Nie udało się zaktualizować WorkArea dla monitora głównego")?;
                 }
-                adjust_maximized_windows_for_monitor(primary_monitor.handle, &primary_full);
+                any_work_changed = true;
+                adjusted_monitors.push((primary_monitor.handle, old_primary_work, primary_full));
             }
         }
 
-
-
+        // 2. Zaktualizuj WorkArea na monitorze docelowym
         let m = target_monitor.monitor_rect;
         let tb_width = taskbar_rect.right - taskbar_rect.left;
         let tb_height = taskbar_rect.bottom - taskbar_rect.top;
@@ -857,22 +1014,39 @@ impl TaskbarState {
             },
         };
 
-        let needs_target_update = get_current_work_rect(target_monitor.handle)
-            .map(|curr| !rects_equal(&curr, &target_work))
-            .unwrap_or(true);
-
-        if needs_target_update {
+        let old_target_work = get_current_work_rect(target_monitor.handle).unwrap_or(m);
+        if !rects_equal(&old_target_work, &target_work) {
             unsafe {
                 SystemParametersInfoW(
                     SPI_SETWORKAREA,
                     0,
                     Some(&mut target_work as *mut RECT as *mut std::ffi::c_void),
-                    SPIF_UPDATEINIFILE,
+                    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
                 )
                 .context("Nie udało się zaktualizować WorkArea dla monitora docelowego")?;
             }
+            any_work_changed = true;
         }
-        adjust_maximized_windows_for_monitor(target_monitor.handle, &target_work);
+        adjusted_monitors.push((target_monitor.handle, old_target_work, target_work));
+
+        // 3. Jeśli którykolwiek obszar roboczy uległ zmianie, wyślij pojedynczy, nieblokujący broadcast WM_SETTINGCHANGE(SPI_SETWORKAREA)
+        if any_work_changed {
+            let now_ms = current_time_ms();
+            LAST_WORKAREA_BROADCAST_MS.store(now_ms, Ordering::Release);
+            unsafe {
+                let _ = SendNotifyMessageW(
+                    HWND_BROADCAST,
+                    WM_SETTINGCHANGE,
+                    WPARAM(SPI_SETWORKAREA.0 as usize),
+                    LPARAM(0),
+                );
+            }
+        }
+
+        // 4. Natychmiast dostosuj okna zmaksymalizowane oraz okna nachodzące na nowy pasek zadań
+        for (hmon, old_w, new_w) in adjusted_monitors {
+            adjust_windows_for_monitor(hmon, &old_w, &new_w);
+        }
 
         Ok(())
     }

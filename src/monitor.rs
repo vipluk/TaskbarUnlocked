@@ -271,7 +271,7 @@ unsafe extern "system" fn monitor_enum_proc(
     BOOL::from(true)
 }
 
-pub fn enumerate_monitors() -> Result<Vec<MonitorDescriptor>, MonitorError> {
+pub fn enumerate_monitors_fast() -> Result<Vec<MonitorDescriptor>, MonitorError> {
     let mut monitors: Vec<MonitorDescriptor> = Vec::new();
     let lparam = LPARAM(&mut monitors as *mut Vec<MonitorDescriptor> as isize);
 
@@ -279,6 +279,12 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorDescriptor>, MonitorError> {
     if !ok.as_bool() || monitors.is_empty() {
         return Err(MonitorError::EnumerationFailed);
     }
+
+    Ok(monitors)
+}
+
+pub fn enumerate_monitors() -> Result<Vec<MonitorDescriptor>, MonitorError> {
+    let mut monitors = enumerate_monitors_fast()?;
 
     let friendly_map = query_friendly_monitor_names();
     for mon in &mut monitors {

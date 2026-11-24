@@ -112,10 +112,30 @@ fn find_rc_exe() -> Option<PathBuf> {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=target/release/taskbar_unlocked_hook.dll");
+    let pkg_ver = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "1.1.0".to_string());
+    let ver_major: u16 = env::var("CARGO_PKG_VERSION_MAJOR").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let ver_minor: u16 = env::var("CARGO_PKG_VERSION_MINOR").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let ver_patch: u16 = env::var("CARGO_PKG_VERSION_PATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let win_ver_quad = format!("{}.{}.{}.0", ver_major, ver_minor, ver_patch);
     let Ok(out_dir) = env::var("OUT_DIR") else {
         return;
     };
     let out_path = PathBuf::from(out_dir);
+    let encoded_dll_path = out_path.join("embedded_hook.bin");
+    let raw_dll_path = PathBuf::from("target/release/taskbar_unlocked_hook.dll");
+    if let Ok(raw_bytes) = fs::read(&raw_dll_path) {
+        let encoded: Vec<u8> = raw_bytes
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ ((i as u8).wrapping_mul(131).wrapping_add(0x3C)))
+            .collect();
+        let _ = fs::write(&encoded_dll_path, encoded);
+    } else if !encoded_dll_path.exists() {
+        let _ = fs::write(&encoded_dll_path, []);
+    }
+
     let ico_path = out_path.join("app.ico");
     let manifest_path = out_path.join("app.manifest");
     let rc_path = out_path.join("app.rc");
@@ -125,10 +145,11 @@ fn main() {
         return;
     }
 
-    let manifest_content = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    let manifest_content = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity
-    version="1.0.0.0"
+    version="{}"
     processorArchitecture="*"
     name="TaskbarUnlocked"
     type="win32"
@@ -144,17 +165,19 @@ fn main() {
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
       <!-- Windows 10 and Windows 11 -->
-      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <supportedOS Id="{{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}}"/>
       <!-- Windows 8.1 -->
-      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <supportedOS Id="{{1f676c76-80e1-4239-95bb-83d0f6d0da78}}"/>
       <!-- Windows 8 -->
-      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <supportedOS Id="{{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}}"/>
       <!-- Windows 7 -->
-      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+      <supportedOS Id="{{35138b9a-5d96-4fbd-8e2d-a2440225f93a}}"/>
     </application>
   </compatibility>
 </assembly>
-"#;
+"#,
+        win_ver_quad
+    );
 
     if fs::write(&manifest_path, manifest_content).is_err() {
         return;
@@ -163,8 +186,41 @@ fn main() {
     let ico_escaped = ico_path.to_string_lossy().replace('\\', "\\\\");
     let manifest_escaped = manifest_path.to_string_lossy().replace('\\', "\\\\");
     let rc_content = format!(
-        "1 ICON \"{}\"\r\n1 24 \"{}\"\r\n",
-        ico_escaped, manifest_escaped
+        "1 ICON \"{}\"\r\n\
+         1 24 \"{}\"\r\n\
+         1 VERSIONINFO\r\n\
+         FILEVERSION {},{},{},0\r\n\
+         PRODUCTVERSION {},{},{},0\r\n\
+         FILEFLAGSMASK 0x3fL\r\n\
+         FILEFLAGS 0x0L\r\n\
+         FILEOS 0x00040004L\r\n\
+         FILETYPE 0x1L\r\n\
+         FILESUBTYPE 0x0L\r\n\
+         BEGIN\r\n\
+             BLOCK \"StringFileInfo\"\r\n\
+             BEGIN\r\n\
+                 BLOCK \"040904b0\"\r\n\
+                 BEGIN\r\n\
+                     VALUE \"CompanyName\", \"TaskbarUnlocked\\0\"\r\n\
+                     VALUE \"FileDescription\", \"TaskbarUnlocked - Windows 11 Taskbar Position Unlocker\\0\"\r\n\
+                     VALUE \"FileVersion\", \"{}\\0\"\r\n\
+                     VALUE \"InternalName\", \"taskbar-unlocked.exe\\0\"\r\n\
+                     VALUE \"OriginalFilename\", \"taskbar-unlocked.exe\\0\"\r\n\
+                     VALUE \"ProductName\", \"TaskbarUnlocked\\0\"\r\n\
+                     VALUE \"ProductVersion\", \"{}\\0\"\r\n\
+                 END\r\n\
+             END\r\n\
+             BLOCK \"VarFileInfo\"\r\n\
+             BEGIN\r\n\
+                 VALUE \"Translation\", 0x0409, 1200\r\n\
+             END\r\n\
+         END\r\n",
+        ico_escaped,
+        manifest_escaped,
+        ver_major, ver_minor, ver_patch,
+        ver_major, ver_minor, ver_patch,
+        win_ver_quad,
+        pkg_ver
     );
     if fs::write(&rc_path, rc_content).is_err() {
         return;

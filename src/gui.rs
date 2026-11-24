@@ -129,6 +129,10 @@ unsafe impl Send for GuiState {}
 
 static GUI_STATE: Mutex<Option<GuiState>> = Mutex::new(None);
 
+fn format_window_title(base_title: &str) -> String {
+    format!("{} (v{})", base_title, env!("CARGO_PKG_VERSION"))
+}
+
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -289,19 +293,53 @@ fn apply_selected_settings(selected_monitor: usize, selected_edge: DockEdge, lan
     TaskbarState::update_registry_stuck_rects3(selected_edge, &tb_state.desired_rect);
 
     let shm = ShmGuard::create_or_open()?;
+    let prev_shm = shm.read();
     let mut shm_cfg = build_shared_config(true, &cfg, &primary, &target, &tb_state);
     shm_cfg.lang_mode = lang as u32;
     shm.write(&shm_cfg);
 
-    if let Ok(dll_path) = resolve_hook_dll_path() {
-        let _ = ensure_hook_dll_injected(tb_state.process_id, &dll_path);
-    }
+    let daemon_running = crate::single_instance::InstanceGuard::is_daemon_running();
+    if daemon_running {
+        let changed = prev_shm
+            .map(|p| {
+                p.active == 0
+                    || p.edge != shm_cfg.edge
+                    || p.target_monitor_index != shm_cfg.target_monitor_index
+            })
+            .unwrap_or(true);
+        if changed {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        } else {
+            TaskbarState::remember_search_mode_and_adapt_widgets(selected_edge);
+        }
+    } else {
+        if let Ok(dll_path) = resolve_hook_dll_path() {
+            let _ = ensure_hook_dll_injected(tb_state.process_id, &dll_path);
+        }
 
-    let _ = tb_state.hide_conflicting_secondary_tray(&target);
-    tb_state.enforce_position()?;
-    tb_state.notify_tray_layout_refresh();
-    TaskbarState::adapt_searchbox_for_edge(selected_edge);
-    TaskbarState::update_work_areas(&primary, &target, &tb_state.desired_rect, cfg.edge)?;
+        let _ = tb_state.hide_conflicting_secondary_tray(&target);
+        tb_state.enforce_position()?;
+        tb_state.notify_tray_layout_refresh();
+        TaskbarState::remember_search_mode_and_adapt_widgets(selected_edge);
+        TaskbarState::update_work_areas(&primary, &target, &tb_state.desired_rect, cfg.edge)?;
+        if matches!(selected_edge, DockEdge::Left | DockEdge::Right) {
+            std::thread::sleep(std::time::Duration::from_millis(110));
+            let full_rect = tb_state.desired_rect;
+            let mut nudge_rect = full_rect;
+            if (nudge_rect.bottom - nudge_rect.top) > 64 {
+                nudge_rect.bottom -= 1;
+            }
+            tb_state.desired_rect = nudge_rect;
+            shm_cfg.desired_taskbar_rect = nudge_rect;
+            shm.write(&shm_cfg);
+            let _ = tb_state.enforce_position_with_frame_refresh();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            tb_state.desired_rect = full_rect;
+            shm_cfg.desired_taskbar_rect = full_rect;
+            shm.write(&shm_cfg);
+            let _ = tb_state.enforce_position_with_frame_refresh();
+        }
+    }
 
 
     if let Ok(mut guard) = GUI_STATE.lock() {
@@ -344,9 +382,32 @@ fn restore_to_primary(selected_monitor: usize, _selected_edge: DockEdge, lang: G
         shm.write(&active_cfg);
     }
 
-    TaskbarState::update_registry_taskbar_location(DockEdge::Bottom);
-    TaskbarState::adapt_searchbox_for_edge(DockEdge::Bottom);
-    tb_state.restore_default(&primary, &prev_target, DockEdge::Bottom, 48)?;
+    unsafe {
+        let mut child = HWND::default();
+        while let Ok(next) = windows::Win32::UI::WindowsAndMessaging::FindWindowExW(
+            HWND::default(),
+            child,
+            w!("Shell_SecondaryTrayWnd"),
+            None,
+        ) {
+            if next.0.is_null() {
+                break;
+            }
+            child = next;
+            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                next,
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOWNA,
+            );
+        }
+    }
+
+    if crate::single_instance::InstanceGuard::is_daemon_running() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    } else {
+        TaskbarState::update_registry_taskbar_location(DockEdge::Bottom);
+        TaskbarState::remember_search_mode_and_adapt_widgets(DockEdge::Bottom);
+        tb_state.restore_default(&primary, &prev_target, DockEdge::Bottom, 48)?;
+    }
 
 
     if let Ok(mut guard) = GUI_STATE.lock() {
@@ -363,7 +424,10 @@ fn refresh_control_labels(hwnd: HWND, lang: GuiLang, _selected_edge: DockEdge, b
     let s = get_gui_strings(lang);
 
     unsafe {
-        let _ = SetWindowTextW(hwnd, PCWSTR(to_wide(s.window_title).as_ptr()));
+        let _ = SetWindowTextW(
+            hwnd,
+            PCWSTR(to_wide(&format_window_title(s.window_title)).as_ptr()),
+        );
         let _ = SetWindowTextW(btns.btn_bottom, PCWSTR(to_wide(s.edge_bottom).as_ptr()));
         let _ = SetWindowTextW(btns.btn_top, PCWSTR(to_wide(s.edge_top).as_ptr()));
         let _ = SetWindowTextW(btns.btn_left, PCWSTR(to_wide(s.edge_left).as_ptr()));
@@ -1024,7 +1088,9 @@ pub fn run_settings_gui() -> Result<()> {
         primary.index
     };
     let mut initial_edge = persisted.edge;
-    TaskbarState::adapt_searchbox_for_edge(initial_edge);
+    if !crate::single_instance::InstanceGuard::is_daemon_running() {
+        TaskbarState::remember_search_mode_and_adapt_widgets(initial_edge);
+    }
 
     let mut initial_locked = persisted.locked;
 
@@ -1114,7 +1180,7 @@ pub fn run_settings_gui() -> Result<()> {
     };
 
 
-    let title_wide = to_wide(get_gui_strings(initial_lang).window_title);
+    let title_wide = to_wide(&format_window_title(get_gui_strings(initial_lang).window_title));
     let hwnd = unsafe {
         CreateWindowExW(
             Default::default(),

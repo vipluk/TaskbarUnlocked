@@ -11,7 +11,7 @@ use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVE
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, KillTimer, PeekMessageW,
     PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetTimer, TranslateMessage,
-    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, MSG, OBJID_WINDOW, PM_REMOVE,
+    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, MSG, OBJID_WINDOW, PM_REMOVE, SPI_SETWORKAREA,
     WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
@@ -19,13 +19,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::injector::ensure_hook_dll_injected;
 use crate::ipc::{SharedConfig, ShmGuard, SHM_MAGIC};
 use crate::monitor::{
-    enumerate_monitors, get_primary_monitor, get_target_monitor, MonitorDescriptor,
+    enumerate_monitors, enumerate_monitors_fast, get_primary_monitor, get_target_monitor,
+    MonitorDescriptor,
 };
-use crate::taskbar::{TaskbarState, TaskbarTargetConfig};
+use crate::taskbar::{
+    current_time_ms, TaskbarState, TaskbarTargetConfig, LAST_WORKAREA_BROADCAST_MS,
+};
 
 const TIMER_REASSERT_WORKAREA: usize = 1001;
 const TIMER_WATCHDOG_POLL: usize = 1002;
 const TIMER_REBIND_DISPLAY: usize = 1003;
+const TIMER_VERTICAL_NUDGE_STEP: usize = 1004;
+const NUDGE_HOLD_MS: u32 = 25;
+const VERTICAL_NUDGE_DELAYS_MS: [u32; 4] = [110, 145, 245, 375];
 
 
 struct GlobalWatcherContext {
@@ -38,6 +44,7 @@ struct GlobalWatcherContext {
     enforcing_lock: bool,
     shm: ShmGuard,
     dll_path: PathBuf,
+    vertical_nudge_phase: u8,
 }
 
 
@@ -201,7 +208,7 @@ unsafe extern "system" fn hidden_wnd_proc(
             let mut work_args = None;
             if let Ok(mut guard) = GLOBAL_CTX.try_lock() {
                 if let Some(ctx) = guard.as_mut() {
-                    if ctx.state.needs_repositioning() {
+                    if ctx.vertical_nudge_phase == 0 && ctx.state.needs_repositioning() {
                         let _ = ctx.state.enforce_position();
                     }
                     if ctx.config.hide_secondary_tray {
@@ -214,11 +221,12 @@ unsafe extern "system" fn hidden_wnd_proc(
                         ctx.target_monitor.clone(),
                         ctx.state.desired_rect,
                         ctx.config.edge,
+                        ctx.state.clone(),
                     ));
                 }
             }
-            if let Some((pm, tm, rc, edge)) = work_args {
-                TaskbarState::adapt_searchbox_for_edge(edge);
+            if let Some((pm, tm, rc, edge, _st)) = work_args {
+                TaskbarState::remember_search_mode_and_adapt_widgets(edge);
                 let _ = TaskbarState::update_work_areas(&pm, &tm, &rc, edge);
             }
             return LRESULT(0);
@@ -236,18 +244,16 @@ unsafe extern "system" fn hidden_wnd_proc(
                     }
                     if !ctx.state.is_valid() {
                         let _ = rebind_taskbar(ctx);
-                    } else {
-                        if ctx.state.needs_repositioning() {
-                            ctx.enforcing_lock = true;
-                            let _ = ctx.state.enforce_position();
-                            ctx.enforcing_lock = false;
-                            work_args = Some((
-                                ctx.primary_monitor.clone(),
-                                ctx.target_monitor.clone(),
-                                ctx.state.desired_rect,
-                                ctx.config.edge,
-                            ));
-                        }
+                    } else if ctx.state.needs_repositioning() {
+                        ctx.enforcing_lock = true;
+                        let _ = ctx.state.enforce_position();
+                        ctx.enforcing_lock = false;
+                        work_args = Some((
+                            ctx.primary_monitor.clone(),
+                            ctx.target_monitor.clone(),
+                            ctx.state.desired_rect,
+                            ctx.config.edge,
+                        ));
                     }
                 }
             }
@@ -274,13 +280,61 @@ unsafe extern "system" fn hidden_wnd_proc(
                 let _ = TaskbarState::update_work_areas(&pm, &tm, &rc, edge);
             }
             return LRESULT(0);
+        } else if timer_id == TIMER_VERTICAL_NUDGE_STEP {
+            let _ = KillTimer(hwnd, TIMER_VERTICAL_NUDGE_STEP);
+            if let Ok(mut guard) = GLOBAL_CTX.try_lock() {
+                if let Some(ctx) = guard.as_mut() {
+                    if !matches!(
+                        ctx.config.edge,
+                        crate::monitor::DockEdge::Left | crate::monitor::DockEdge::Right
+                    ) {
+                        ctx.vertical_nudge_phase = 0;
+                        return LRESULT(0);
+                    }
+                    let phase = ctx.vertical_nudge_phase;
+                    match phase {
+                        1 | 3 | 5 | 7 => {
+                            apply_vertical_nudge_rect(ctx, true);
+                            ctx.vertical_nudge_phase = phase + 1;
+                            let _ = SetTimer(hwnd, TIMER_VERTICAL_NUDGE_STEP, NUDGE_HOLD_MS, None);
+                        }
+                        2 | 4 | 6 => {
+                            apply_vertical_nudge_rect(ctx, false);
+                            let next_idx = (phase / 2) as usize;
+                            ctx.vertical_nudge_phase = phase + 1;
+                            let _ = SetTimer(
+                                hwnd,
+                                TIMER_VERTICAL_NUDGE_STEP,
+                                VERTICAL_NUDGE_DELAYS_MS[next_idx],
+                                None,
+                            );
+                        }
+                        8 => {
+                            apply_vertical_nudge_rect(ctx, false);
+                            ctx.vertical_nudge_phase = 0;
+                        }
+                        _ => {
+                            ctx.vertical_nudge_phase = 0;
+                        }
+                    }
+                }
+            } else {
+                let _ = SetTimer(hwnd, TIMER_VERTICAL_NUDGE_STEP, 15, None);
+            }
+            return LRESULT(0);
         }
     }
 
     if msg == WM_DISPLAYCHANGE || msg == WM_DPICHANGED {
         let _ = SetTimer(hwnd, TIMER_REBIND_DISPLAY, 120, None);
     } else if msg == WM_SETTINGCHANGE {
-        let _ = SetTimer(hwnd, TIMER_REASSERT_WORKAREA, 80, None);
+        if wparam.0 == SPI_SETWORKAREA.0 as usize {
+            let now_ms = current_time_ms();
+            let last_ms = LAST_WORKAREA_BROADCAST_MS.load(Ordering::Acquire);
+            if now_ms.saturating_sub(last_ms) >= 250 {
+                let _ = SetTimer(hwnd, TIMER_REASSERT_WORKAREA, 80, None);
+            }
+        }
     }
 
 
@@ -314,6 +368,9 @@ fn rebind_taskbar(ctx: &mut GlobalWatcherContext) -> Result<()> {
     let mut new_state =
         TaskbarState::locate(&target, ctx.config.edge, ctx.config.size_override)?;
 
+    TaskbarState::update_registry_taskbar_location(ctx.config.edge);
+    TaskbarState::update_registry_stuck_rects3(ctx.config.edge, &new_state.desired_rect);
+
     let shm_cfg = build_shared_config(true, &ctx.config, &primary, &target, &new_state);
     ctx.shm.write(&shm_cfg);
 
@@ -326,7 +383,14 @@ fn rebind_taskbar(ctx: &mut GlobalWatcherContext) -> Result<()> {
     }
     new_state.enforce_position()?;
     new_state.notify_tray_layout_refresh();
-    TaskbarState::adapt_searchbox_for_edge(ctx.config.edge);
+    TaskbarState::remember_search_mode_and_adapt_widgets(ctx.config.edge);
+    unsafe {
+        schedule_vertical_refresh_if_needed(
+            ctx.message_hwnd,
+            ctx.config.edge,
+            &mut ctx.vertical_nudge_phase,
+        );
+    }
 
 
     // idThread = 0 monitoruje wszystkie wątki w procesie explorer.exe (w tym wątki XAML / Taskbar.View.dll)
@@ -444,6 +508,149 @@ pub fn run_daemon(config: TaskbarTargetConfig) -> Result<()> {
 }
 
 
+fn apply_vertical_nudge_rect(ctx: &mut GlobalWatcherContext, shrink_one_px: bool) {
+    let mut full_rect = TaskbarState::compute_desired_rect(
+        &ctx.state.desired_rect,
+        &ctx.target_monitor,
+        ctx.config.edge,
+        ctx.config.size_override,
+    );
+    if shrink_one_px && (full_rect.bottom - full_rect.top) > 64 {
+        full_rect.bottom -= 1;
+    }
+    ctx.state.desired_rect = full_rect;
+
+    let prev_locked = ctx.shm.read().map(|c| c.locked).unwrap_or(0);
+    let mut shm_cfg = build_shared_config(
+        true,
+        &ctx.config,
+        &ctx.primary_monitor,
+        &ctx.target_monitor,
+        &ctx.state,
+    );
+    shm_cfg.locked = prev_locked;
+    ctx.shm.write(&shm_cfg);
+
+    ctx.enforcing_lock = true;
+    let _ = ctx.state.enforce_position_with_frame_refresh();
+    ctx.enforcing_lock = false;
+}
+
+unsafe fn schedule_vertical_refresh_if_needed(
+    hwnd: HWND,
+    edge: crate::monitor::DockEdge,
+    phase_out: &mut u8,
+) {
+    if hwnd.0.is_null() {
+        *phase_out = 0;
+        return;
+    }
+    if matches!(
+        edge,
+        crate::monitor::DockEdge::Left | crate::monitor::DockEdge::Right
+    ) {
+        *phase_out = 1;
+        let _ = SetTimer(hwnd, TIMER_VERTICAL_NUDGE_STEP, VERTICAL_NUDGE_DELAYS_MS[0], None);
+    } else {
+        *phase_out = 0;
+        let _ = KillTimer(hwnd, TIMER_VERTICAL_NUDGE_STEP);
+    }
+}
+
+fn apply_taskbar_geometry_move(
+    new_mon_idx: usize,
+    new_edge: crate::monitor::DockEdge,
+    is_locked: bool,
+) -> HWND {
+    TaskbarState::update_registry_taskbar_location(new_edge);
+
+    let mut post_work_args = None;
+    let mut msg_hwnd = HWND::default();
+
+    if let Ok(monitors) = enumerate_monitors_fast() {
+        if let (Ok(primary), Ok(target)) = (
+            get_primary_monitor(&monitors),
+            get_target_monitor(&monitors, new_mon_idx),
+        ) {
+            if let Ok(mut guard) = GLOBAL_CTX.lock() {
+                if let Some(ctx) = guard.as_mut() {
+                    ctx.config.target_monitor_index = new_mon_idx;
+                    ctx.config.edge = new_edge;
+
+                    let new_rect = TaskbarState::compute_desired_rect(
+                        &ctx.state.desired_rect,
+                        &target,
+                        new_edge,
+                        ctx.config.size_override,
+                    );
+                    TaskbarState::update_registry_stuck_rects3(new_edge, &new_rect);
+
+                    ctx.primary_monitor = primary;
+                    ctx.target_monitor = target;
+                    ctx.state.desired_rect = new_rect;
+                    msg_hwnd = ctx.message_hwnd;
+
+                    let mut new_shm = build_shared_config(
+                        true,
+                        &ctx.config,
+                        &ctx.primary_monitor,
+                        &ctx.target_monitor,
+                        &ctx.state,
+                    );
+                    new_shm.locked = if is_locked { 1 } else { 0 };
+                    ctx.shm.write(&new_shm);
+
+                    if ctx.config.hide_secondary_tray {
+                        let _ = ctx
+                            .state
+                            .hide_conflicting_secondary_tray(&ctx.target_monitor);
+                    }
+                    ctx.enforcing_lock = true;
+                    let _ = ctx.state.enforce_position();
+                    ctx.state.notify_tray_layout_refresh();
+                    ctx.enforcing_lock = false;
+
+                    unsafe {
+                        schedule_vertical_refresh_if_needed(
+                            ctx.message_hwnd,
+                            new_edge,
+                            &mut ctx.vertical_nudge_phase,
+                        );
+                    }
+
+                    post_work_args = Some((
+                        ctx.primary_monitor.clone(),
+                        ctx.target_monitor.clone(),
+                        ctx.state.desired_rect,
+                        new_edge,
+                    ));
+                }
+            }
+        }
+    }
+
+    TaskbarState::remember_search_mode_and_adapt_widgets(new_edge);
+    if let Some((pm, tm, rc, edge)) = post_work_args {
+        let _ = TaskbarState::update_work_areas(&pm, &tm, &rc, edge);
+    }
+    if !msg_hwnd.0.is_null() {
+        unsafe {
+            let _ = SetTimer(msg_hwnd, TIMER_REASSERT_WORKAREA, 350, None);
+        }
+    }
+
+    let prev = crate::installer::load_persisted_settings();
+    crate::installer::save_persisted_settings(&crate::installer::PersistedSettings {
+        active: true,
+        locked: is_locked,
+        monitor_index: new_mon_idx,
+        edge: new_edge,
+        lang_mode: prev.lang_mode,
+    });
+
+    msg_hwnd
+}
+
 pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
     let monitors = enumerate_monitors()?;
     let primary_monitor = get_primary_monitor(&monitors)?;
@@ -510,7 +717,6 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
 
     TaskbarState::update_registry_taskbar_location(config.edge);
     TaskbarState::update_registry_stuck_rects3(config.edge, &state.desired_rect);
-    TaskbarState::adapt_searchbox_for_edge(config.edge);
     state.enforce_position()?;
     state.notify_tray_layout_refresh();
     TaskbarState::update_work_areas(
@@ -519,6 +725,7 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
         &state.desired_rect,
         config.edge,
     )?;
+    TaskbarState::remember_search_mode_and_adapt_widgets(config.edge);
 
 
     let hinstance = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW error")?;
@@ -578,9 +785,17 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
         ));
     }
 
+    let mut init_nudge_phase = 0u8;
     unsafe {
         SetTimer(message_hwnd, TIMER_WATCHDOG_POLL, 150, None);
         SetTimer(message_hwnd, TIMER_REASSERT_WORKAREA, 600, None);
+        if matches!(
+            config.edge,
+            crate::monitor::DockEdge::Left | crate::monitor::DockEdge::Right
+        ) {
+            init_nudge_phase = 1;
+            let _ = SetTimer(message_hwnd, TIMER_VERTICAL_NUDGE_STEP, 150, None);
+        }
     }
 
 
@@ -598,6 +813,7 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
             enforcing_lock: false,
             shm,
             dll_path,
+            vertical_nudge_phase: init_nudge_phase,
         });
     }
 
@@ -629,110 +845,99 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
             break;
         }
 
-        let mut tray_info: Option<(HWND, usize, crate::monitor::DockEdge, bool)> = None;
-        if let Ok(guard) = GLOBAL_CTX.lock() {
-            if let Some(ctx) = guard.as_ref() {
-                let is_locked = ctx
-                    .shm
-                    .read()
-                    .map(|c| c.locked != 0)
-                    .unwrap_or(false);
-                tray_info = Some((
-                    ctx.state.main_tray_hwnd,
-                    ctx.config.target_monitor_index,
-                    ctx.config.edge,
-                    is_locked,
-                ));
+        let mut tray_info: Option<(
+            HWND,
+            usize,
+            crate::monitor::DockEdge,
+            bool,
+            MonitorDescriptor,
+            windows::Win32::Foundation::RECT,
+        )> = None;
+        let mut shm_edge_changed: Option<(
+            MonitorDescriptor,
+            MonitorDescriptor,
+            windows::Win32::Foundation::RECT,
+            crate::monitor::DockEdge,
+            HWND,
+        )> = None;
+        if let Ok(mut guard) = GLOBAL_CTX.lock() {
+            if let Some(ctx) = guard.as_mut() {
+                let prev_edge = ctx.config.edge;
+                let prev_mon = ctx.config.target_monitor_index;
+                if sync_ctx_from_shm(ctx) {
+                    if ctx.config.edge != prev_edge || ctx.config.target_monitor_index != prev_mon {
+                        TaskbarState::update_registry_taskbar_location(ctx.config.edge);
+                        let full_rect = TaskbarState::compute_desired_rect(
+                            &ctx.state.desired_rect,
+                            &ctx.target_monitor,
+                            ctx.config.edge,
+                            ctx.config.size_override,
+                        );
+                        ctx.state.desired_rect = full_rect;
+                        TaskbarState::update_registry_stuck_rects3(ctx.config.edge, &full_rect);
+
+                        if ctx.config.hide_secondary_tray {
+                            let _ = ctx
+                                .state
+                                .hide_conflicting_secondary_tray(&ctx.target_monitor);
+                        }
+                        ctx.enforcing_lock = true;
+                        let _ = ctx.state.enforce_position();
+                        ctx.state.notify_tray_layout_refresh();
+                        ctx.enforcing_lock = false;
+
+                        unsafe {
+                            schedule_vertical_refresh_if_needed(
+                                ctx.message_hwnd,
+                                ctx.config.edge,
+                                &mut ctx.vertical_nudge_phase,
+                            );
+                        }
+
+                        shm_edge_changed = Some((
+                            ctx.primary_monitor.clone(),
+                            ctx.target_monitor.clone(),
+                            ctx.state.desired_rect,
+                            ctx.config.edge,
+                            ctx.message_hwnd,
+                        ));
+                    }
+                    let is_locked = ctx
+                        .shm
+                        .read()
+                        .map(|c| c.locked != 0)
+                        .unwrap_or(false);
+                    tray_info = Some((
+                        ctx.state.main_tray_hwnd,
+                        ctx.config.target_monitor_index,
+                        ctx.config.edge,
+                        is_locked,
+                        ctx.target_monitor.clone(),
+                        ctx.state.desired_rect,
+                    ));
+                }
             }
         }
 
-        if let Some((tray_hwnd, cur_mon, cur_edge, is_locked)) = tray_info {
+        if let Some((pm, tm, rc, edge, msg_hwnd)) = shm_edge_changed {
+            TaskbarState::remember_search_mode_and_adapt_widgets(edge);
+            let _ = TaskbarState::update_work_areas(&pm, &tm, &rc, edge);
+            if !msg_hwnd.0.is_null() {
+                unsafe {
+                    let _ = SetTimer(msg_hwnd, TIMER_REASSERT_WORKAREA, 350, None);
+                }
+            }
+        }
+
+        if let Some((tray_hwnd, cur_mon, cur_edge, is_locked, ref target_mon, ref desired_rc)) =
+            tray_info
+        {
+            TaskbarState::reposition_control_center(target_mon, desired_rc, cur_edge);
+
             if let Some((new_mon_idx, new_edge)) =
                 drag_ctrl.poll_step(tray_hwnd, cur_mon, cur_edge, is_locked)
             {
-                let prev = crate::installer::load_persisted_settings();
-                crate::installer::save_persisted_settings(
-                    &crate::installer::PersistedSettings {
-                        active: true,
-                        locked: is_locked,
-                        monitor_index: new_mon_idx,
-                        edge: new_edge,
-                        lang_mode: prev.lang_mode,
-                    },
-                );
-
-                TaskbarState::update_registry_taskbar_location(new_edge);
-
-
-                let mut post_work_args = None;
-                if let Ok(monitors) = enumerate_monitors() {
-                    if let (Ok(primary), Ok(target)) = (
-                        get_primary_monitor(&monitors),
-                        get_target_monitor(&monitors, new_mon_idx),
-                    ) {
-                        if let Ok(mut guard) = GLOBAL_CTX.lock() {
-                            if let Some(ctx) = guard.as_mut() {
-                                ctx.config.target_monitor_index = new_mon_idx;
-                                ctx.config.edge = new_edge;
-
-                                let new_rect = TaskbarState::compute_desired_rect(
-                                    &ctx.state.desired_rect,
-                                    &target,
-                                    new_edge,
-                                    ctx.config.size_override,
-                                );
-                                ctx.primary_monitor = primary;
-                                ctx.target_monitor = target;
-                                ctx.state.desired_rect = new_rect;
-
-                                TaskbarState::update_registry_stuck_rects3(new_edge, &new_rect);
-
-                                let mut new_shm = build_shared_config(
-                                    true,
-                                    &ctx.config,
-                                    &ctx.primary_monitor,
-                                    &ctx.target_monitor,
-                                    &ctx.state,
-                                );
-                                new_shm.locked = if is_locked { 1 } else { 0 };
-                                ctx.shm.write(&new_shm);
-
-                                if ctx.config.hide_secondary_tray {
-                                    let _ = ctx
-                                        .state
-                                        .hide_conflicting_secondary_tray(&ctx.target_monitor);
-                                }
-                                ctx.enforcing_lock = true;
-                                let _ = ctx.state.enforce_position();
-                                ctx.state.notify_tray_layout_refresh();
-                                ctx.enforcing_lock = false;
-
-                                if !ctx.message_hwnd.0.is_null() {
-                                    unsafe {
-                                        let _ = SetTimer(
-                                            ctx.message_hwnd,
-                                            TIMER_REASSERT_WORKAREA,
-                                            90,
-                                            None,
-                                        );
-                                    }
-                                }
-
-                                post_work_args = Some((
-                                    ctx.primary_monitor.clone(),
-                                    ctx.target_monitor.clone(),
-                                    ctx.state.desired_rect,
-                                    new_edge,
-                                ));
-                            }
-                        }
-                    }
-                }
-                TaskbarState::adapt_searchbox_for_edge(new_edge);
-                if let Some((pm, tm, rc, edge)) = post_work_args {
-                    let _ = TaskbarState::update_work_areas(&pm, &tm, &rc, edge);
-                }
-
+                let _ = apply_taskbar_geometry_move(new_mon_idx, new_edge, is_locked);
             }
         }
 
@@ -743,8 +948,11 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
 
 
     if let Ok(mut guard) = GLOBAL_CTX.lock() {
-        if let Some(ctx) = guard.take() {
+        if let Some(mut ctx) = guard.take() {
             println!("[shutdown] Wyłączanie hooka SHM oraz przywracanie domyślnej pozycji paska zadań i obszarów roboczych...");
+            if ctx.vertical_nudge_phase != 0 && ctx.vertical_nudge_phase % 2 == 0 {
+                apply_vertical_nudge_rect(&mut ctx, false);
+            }
             let disabled_cfg = build_shared_config(
                 false,
                 &ctx.config,
@@ -761,6 +969,7 @@ pub fn run_watcher_loop(config: TaskbarTargetConfig) -> Result<()> {
                 if !ctx.message_hwnd.0.is_null() {
                     let _ = KillTimer(ctx.message_hwnd, TIMER_WATCHDOG_POLL);
                     let _ = KillTimer(ctx.message_hwnd, TIMER_REASSERT_WORKAREA);
+                    let _ = KillTimer(ctx.message_hwnd, TIMER_VERTICAL_NUDGE_STEP);
                     let _ = DestroyWindow(ctx.message_hwnd);
                 }
             }

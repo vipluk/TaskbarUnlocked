@@ -32,7 +32,15 @@ use crate::watcher::build_shared_config;
 const REG_APP_KEY: PCWSTR = w!("Software\\TaskbarUnlocked");
 const REG_RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const REG_RUN_VAL_NAME: PCWSTR = w!("TaskbarUnlocked");
-const EMBEDDED_HOOK_DLL: &[u8] = include_bytes!("../target/release/taskbar_unlocked_hook.dll");
+const EMBEDDED_HOOK_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/embedded_hook.bin"));
+
+fn decode_embedded_hook_dll() -> Vec<u8> {
+    EMBEDDED_HOOK_BIN
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| b ^ ((i as u8).wrapping_mul(131).wrapping_add(0x3C)))
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct PersistedSettings {
@@ -304,9 +312,10 @@ pub fn spawn_background_daemon(exe_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub fn perform_install() -> Result<()> {
-    let fresh_install = !is_installed();
-    if fresh_install {
+fn install_internal(preserved_settings: Option<PersistedSettings>) -> Result<()> {
+    let has_existing_storage = crate::storage::get_storage_path().exists();
+    let first_ever_install = !has_existing_storage && preserved_settings.is_none();
+    if first_ever_install {
         let _ = crate::storage::capture_native_baseline();
     }
 
@@ -333,17 +342,26 @@ pub fn perform_install() -> Result<()> {
     }
     if cur_dll.exists() && cur_dll != target_dll {
         let _ = std::fs::copy(&cur_dll, &target_dll);
-    } else if !target_dll.exists() {
-        let _ = std::fs::write(&target_dll, EMBEDDED_HOOK_DLL);
+    } else {
+        let decoded = decode_embedded_hook_dll();
+        if !decoded.is_empty() {
+            let _ = std::fs::write(&target_dll, decoded);
+        }
     }
 
-    let mut initial_settings = load_persisted_settings();
-    if fresh_install {
-        if let Ok(monitors) = enumerate_monitors() {
-            if let Ok(primary) = get_primary_monitor(&monitors) {
+    let mut initial_settings = match preserved_settings {
+        Some(saved) => saved,
+        None => load_persisted_settings(),
+    };
+    if let Ok(monitors) = enumerate_monitors() {
+        if let Ok(primary) = get_primary_monitor(&monitors) {
+            if first_ever_install {
                 let disk_storage = crate::storage::load_or_init_storage();
-                let native_edge = crate::storage::native_edge(&disk_storage.baseline, &primary.monitor_rect);
+                let native_edge =
+                    crate::storage::native_edge(&disk_storage.baseline, &primary.monitor_rect);
                 initial_settings.edge = native_edge;
+                initial_settings.monitor_index = primary.index;
+            } else if initial_settings.monitor_index >= monitors.len() {
                 initial_settings.monitor_index = primary.index;
             }
         }
@@ -420,6 +438,10 @@ pub fn perform_install() -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn perform_install() -> Result<()> {
+    install_internal(None)
 }
 
 fn restart_explorer() {
@@ -577,6 +599,18 @@ pub fn perform_uninstall() -> Result<()> {
 }
 
 pub fn perform_reinstall() -> Result<()> {
+    let mut saved_before_reinstall = load_persisted_settings();
+    if let Some(shm) = ShmGuard::open_existing() {
+        if let Some(cfg) = shm.read() {
+            if cfg.active != 0 {
+                saved_before_reinstall.monitor_index = cfg.target_monitor_index as usize;
+                saved_before_reinstall.edge = TaskbarState::abe_to_edge(cfg.edge);
+                saved_before_reinstall.locked = cfg.locked != 0;
+                saved_before_reinstall.lang_mode = cfg.lang_mode;
+            }
+        }
+    }
+
     // 1. KROK 1: Dosłowne, pełne odinstalowanie poprzedniej instalacji
     uninstall_internal(false)?;
 
@@ -595,8 +629,8 @@ pub fn perform_reinstall() -> Result<()> {
     // Dodatkowa solidna przerwa na załadowanie podsystemów XAML i powłoki Windows 11
     std::thread::sleep(std::time::Duration::from_millis(1500));
 
-    // 3. KROK 3: Czysta, świeża instalacja od zera
-    perform_install()
+    // 3. KROK 3: Czysta instalacja z przywróceniem ostatnio używanego miejsca z aplikacji
+    install_internal(Some(saved_before_reinstall))
 }
 
 pub fn toggle_install_or_uninstall() -> Result<()> {

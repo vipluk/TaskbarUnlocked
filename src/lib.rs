@@ -14,14 +14,17 @@ use retour::RawDetour;
 use windows::core::{s, w};
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HMODULE, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{HMONITOR, MONITORINFO};
-use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::LibraryLoader::{
+    GetModuleFileNameW, GetModuleHandleExW, GetModuleHandleW, GetProcAddress,
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
+};
 use windows::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS};
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{ABM_GETTASKBARPOS, ABM_QUERYPOS, ABM_SETPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, FindWindowW, GetClassNameW, GetCursorPos, GetWindowLongPtrW,
+    CallNextHookEx, CallWindowProcW, FindWindowW, GetClassNameW, GetCursorPos, GetWindowLongPtrW,
     GetWindowThreadProcessId, IsChild, IsWindow, SetWindowLongPtrW, GWLP_WNDPROC, HDWP,
     MONITORINFOF_PRIMARY, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS, WM_WINDOWPOSCHANGING, WNDPROC,
 };
@@ -40,6 +43,8 @@ type FnSetWindowPos =
 type FnDeferWindowPos =
     unsafe extern "system" fn(HDWP, HWND, HWND, i32, i32, i32, i32, u32) -> HDWP;
 type FnSHAppBarMessage = unsafe extern "system" fn(u32, *mut APPBARDATA) -> usize;
+type FnSystemParametersInfoW =
+    unsafe extern "system" fn(u32, u32, *mut std::ffi::c_void, u32) -> BOOL;
 
 struct HookTable {
     detour_get_monitor_info_w: Option<RawDetour>,
@@ -49,6 +54,7 @@ struct HookTable {
     detour_set_window_pos: Option<RawDetour>,
     detour_defer_window_pos: Option<RawDetour>,
     detour_sh_appbar_message: Option<RawDetour>,
+    detour_system_parameters_info_w: Option<RawDetour>,
 }
 
 unsafe impl Send for HookTable {}
@@ -472,6 +478,79 @@ unsafe extern "system" fn hooked_sh_appbar_message(
     orig(dw_message, p_data)
 }
 
+unsafe extern "system" fn hooked_system_parameters_info_w(
+    ui_action: u32,
+    ui_param: u32,
+    pv_param: *mut std::ffi::c_void,
+    mut f_win_ini: u32,
+) -> BOOL {
+    let Some(hooks) = HOOKS.get() else {
+        return BOOL::from(false);
+    };
+    let Some(detour) = hooks.detour_system_parameters_info_w.as_ref() else {
+        return BOOL::from(false);
+    };
+    let orig: FnSystemParametersInfoW = std::mem::transmute(detour.trampoline());
+
+    // SPI_SETWORKAREA == 0x002F (47)
+    if ui_action == 0x002F && !pv_param.is_null() {
+        if let Some(cfg) = active_config() {
+            let rc = &mut *(pv_param as *mut RECT);
+            let cx = (rc.left + rc.right) / 2;
+            let cy = (rc.top + rc.bottom) / 2;
+
+            let in_target = cx >= cfg.target_rect.left
+                && cx < cfg.target_rect.right
+                && cy >= cfg.target_rect.top
+                && cy < cfg.target_rect.bottom;
+            let in_primary = cx >= cfg.primary_rect.left
+                && cx < cfg.primary_rect.right
+                && cy >= cfg.primary_rect.top
+                && cy < cfg.primary_rect.bottom;
+
+            if in_target {
+                let m = cfg.target_rect;
+                let tb_w = (cfg.desired_taskbar_rect.right - cfg.desired_taskbar_rect.left).max(0);
+                let tb_h = (cfg.desired_taskbar_rect.bottom - cfg.desired_taskbar_rect.top).max(0);
+                *rc = match cfg.edge {
+                    0 => RECT {
+                        left: m.left + tb_w,
+                        top: m.top,
+                        right: m.right,
+                        bottom: m.bottom,
+                    },
+                    1 => RECT {
+                        left: m.left,
+                        top: m.top + tb_h,
+                        right: m.right,
+                        bottom: m.bottom,
+                    },
+                    2 => RECT {
+                        left: m.left,
+                        top: m.top,
+                        right: m.right - tb_w,
+                        bottom: m.bottom,
+                    },
+                    _ => RECT {
+                        left: m.left,
+                        top: m.top,
+                        right: m.right,
+                        bottom: m.bottom - tb_h,
+                    },
+                };
+            } else if in_primary && cfg.primary_hmonitor != cfg.target_hmonitor {
+                *rc = cfg.primary_rect;
+            }
+
+            // Zdejmij blokujące flagi SPIF_UPDATEINIFILE | SPIF_SENDCHANGE przy wywołaniach z explorer.exe,
+            // aby uniknąć synchronicznego SendMessageTimeoutW(HWND_BROADCAST) i burzy WM_SETTINGCHANGE.
+            f_win_ini = 0;
+        }
+    }
+
+    orig(ui_action, ui_param, pv_param, f_win_ini)
+}
+
 
 unsafe fn restore_export_prologue_if_hooked(hmod: HMODULE, fn_addr: usize) {
     if fn_addr == 0 || *(fn_addr as *const u8) != 0xE9 {
@@ -554,6 +633,10 @@ unsafe fn install_all_hooks() -> Option<HookTable> {
         hook_user32(s!("SetWindowPos"), hooked_set_window_pos as *const ());
     let detour_defer_window_pos =
         hook_user32(s!("DeferWindowPos"), hooked_defer_window_pos as *const ());
+    let detour_system_parameters_info_w = hook_user32(
+        s!("SystemParametersInfoW"),
+        hooked_system_parameters_info_w as *const (),
+    );
 
     let detour_sh_appbar_message = GetModuleHandleW(w!("shell32.dll"))
         .ok()
@@ -576,6 +659,7 @@ unsafe fn install_all_hooks() -> Option<HookTable> {
         detour_set_window_pos,
         detour_defer_window_pos,
         detour_sh_appbar_message,
+        detour_system_parameters_info_w,
     })
 }
 
@@ -603,32 +687,58 @@ fn enable_installed_hooks() {
             if let Some(d) = hooks.detour_sh_appbar_message.as_ref() {
                 let _ = d.enable();
             }
+            if let Some(d) = hooks.detour_system_parameters_info_w.as_ref() {
+                let _ = d.enable();
+            }
         }
     }
 }
 
 
 #[no_mangle]
+pub unsafe extern "system" fn taskbar_hook_proc(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
+#[no_mangle]
 pub unsafe extern "system" fn DllMain(
-    _hinst_dll: HINSTANCE,
+    hinst_dll: HINSTANCE,
     fdw_reason: u32,
     _lpv_reserved: *mut std::ffi::c_void,
 ) -> BOOL {
     if fdw_reason == DLL_PROCESS_ATTACH {
-        std::thread::spawn(|| {
-            crate::daemon_log::log_line("[hook] DllMain: DLL_PROCESS_ATTACH w explorer.exe");
-            if HOOKS.get().is_none() {
-                if let Some(table) = unsafe { install_all_hooks() } {
-                    let _ = HOOKS.set(table);
-                    enable_installed_hooks();
-                    crate::daemon_log::log_line("[hook] Główne hooki Win32 (Monitor/SetWindowPos) zainstalowane pomyślnie.");
-                } else {
-                    crate::daemon_log::log_line("[hook] BŁĄD: install_all_hooks zwróciło None");
+        // Przypnij moduł w pamięci tylko gdy jesteśmy załadowani wewnątrz explorer.exe
+        let mut exe_buf = [0u16; 260];
+        let len = GetModuleFileNameW(HMODULE::default(), &mut exe_buf) as usize;
+        let exe_name = String::from_utf16_lossy(&exe_buf[..len]).to_ascii_lowercase();
+        if exe_name.ends_with("explorer.exe") {
+            let mut pinned = HMODULE::default();
+            let _ = GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                windows::core::PCWSTR(hinst_dll.0 as *const u16),
+                &mut pinned,
+            );
+            std::thread::spawn(|| {
+                crate::daemon_log::log_line("[hook] DllMain: DLL_PROCESS_ATTACH w explorer.exe");
+                if HOOKS.get().is_none() {
+                    if let Some(table) = unsafe { install_all_hooks() } {
+                        let _ = HOOKS.set(table);
+                        enable_installed_hooks();
+                        crate::daemon_log::log_line(
+                            "[hook] Główne hooki Win32 (Monitor/SetWindowPos) zainstalowane pomyślnie.",
+                        );
+                    } else {
+                        crate::daemon_log::log_line("[hook] BŁĄD: install_all_hooks zwróciło None");
+                    }
                 }
-            }
-            let _ = get_tray_hwnd();
-            crate::context_menu::init_context_menu_hooks();
-        });
+                let _ = get_tray_hwnd();
+                crate::context_menu::init_context_menu_hooks();
+            });
+        }
     }
     BOOL::from(true)
 }

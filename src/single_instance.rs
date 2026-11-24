@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Result};
 use windows::core::w;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
-use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
+use windows::Win32::System::Threading::{
+    CreateMutexW, OpenMutexW, ReleaseMutex, SYNCHRONIZATION_ACCESS_RIGHTS,
+};
 
 pub struct InstanceGuard(HANDLE);
 
@@ -9,6 +11,23 @@ unsafe impl Send for InstanceGuard {}
 unsafe impl Sync for InstanceGuard {}
 
 impl InstanceGuard {
+    pub fn is_daemon_running() -> bool {
+        unsafe {
+            // SYNCHRONIZE = 0x0010_0000
+            if let Ok(handle) = OpenMutexW(
+                SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000),
+                false,
+                w!("Local\\TaskbarUnlockedDaemon"),
+            ) {
+                if !handle.is_invalid() && !handle.0.is_null() {
+                    let _ = CloseHandle(handle);
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
     pub fn acquire() -> Result<Option<Self>> {
         unsafe {
             let handle = CreateMutexW(None, true, w!("Local\\TaskbarUnlockedDaemon"))

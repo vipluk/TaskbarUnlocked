@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Mutex;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use windows::core::w;
@@ -12,6 +13,8 @@ use crate::monitor::DockEdge;
 use crate::taskbar::TaskbarState;
 
 pub const BASELINE_VERSION: u32 = 2;
+
+pub static STORAGE_CACHE: Mutex<Option<AppDiskStorage>> = Mutex::new(None);
 
 fn default_one() -> u32 {
     1
@@ -291,10 +294,19 @@ pub fn read_current_windows_registry_baseline() -> WindowsBaseline {
 }
 
 pub fn load_or_init_storage() -> AppDiskStorage {
+    if let Ok(guard) = STORAGE_CACHE.lock() {
+        if let Some(cached) = guard.as_ref() {
+            return cached.clone();
+        }
+    }
+
     let p = get_storage_path();
     if p.exists() {
         if let Ok(data) = std::fs::read_to_string(&p) {
             if let Ok(parsed) = serde_json::from_str::<AppDiskStorage>(&data) {
+                if let Ok(mut guard) = STORAGE_CACHE.lock() {
+                    *guard = Some(parsed.clone());
+                }
                 return parsed;
             }
         }
@@ -308,8 +320,6 @@ pub fn load_or_init_storage() -> AppDiskStorage {
     prefs.horizontal_task_view_mode = baseline.task_view_mode;
     prefs.horizontal_chat_mode = baseline.chat_mode;
 
-
-
     let storage = AppDiskStorage {
         baseline,
         preferences: prefs,
@@ -319,6 +329,9 @@ pub fn load_or_init_storage() -> AppDiskStorage {
 }
 
 pub fn save_storage(storage: &AppDiskStorage) -> Result<()> {
+    if let Ok(mut guard) = STORAGE_CACHE.lock() {
+        *guard = Some(storage.clone());
+    }
     let p = get_storage_path();
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -462,11 +475,7 @@ pub fn restore_windows_baseline(primary_rect: &RECT) -> Result<()> {
         );
     }
 
-    let restore_search = if p.horizontal_search_mode > 1 {
-        p.horizontal_search_mode
-    } else {
-        b.searchbox_mode
-    };
+    let restore_search = p.horizontal_search_mode;
 
     let target_loc = if trustworthy {
         b.taskbar_location
